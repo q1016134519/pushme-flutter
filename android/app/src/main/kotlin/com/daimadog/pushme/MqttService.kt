@@ -303,7 +303,20 @@ class MqttService : Service(), MqttCallbackExtended {
 
     /** 把 Paho / 网络异常翻译成用户看得懂的文案（会直接显示在通知栏正文里） */
     private fun friendlyError(e: Exception): String {
-        if (e is java.net.SocketTimeoutException) return "连接超时"
+        // Paho 会把底层异常包一层再抛，reasonCode 常常退化成 0，
+        // 所以先沿 cause 链找真正的根因（超时/拒绝连接），再看 reasonCode。
+        var cur: Throwable? = e
+        var depth = 0
+        while (cur != null && depth < 8) {
+            when (cur) {
+                is java.net.SocketTimeoutException -> return "连接超时"
+                is java.net.UnknownHostException -> return "地址解析失败"
+                is java.net.ConnectException -> return "服务器不可达"
+                is java.net.NoRouteToHostException -> return "网络不可用"
+            }
+            cur = cur.cause
+            depth++
+        }
         val me = e as? org.eclipse.paho.client.mqttv3.MqttException
         if (me != null) {
             return when (me.reasonCode) {
@@ -314,7 +327,11 @@ class MqttService : Service(), MqttCallbackExtended {
                 32109, 32110 -> "连接被中断"
                 else -> {
                     val m = me.message
-                    if (m.isNullOrBlank() || m == "MqttException") "连接失败（${me.reasonCode}）" else m
+                    when {
+                        !m.isNullOrBlank() && m != "MqttException" -> m
+                        me.reasonCode > 0 -> "连接失败（${me.reasonCode}）"
+                        else -> "连接失败"
+                    }
                 }
             }
         }
