@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
@@ -109,7 +110,12 @@ class MqttService : Service(), MqttCallbackExtended {
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var cfgReceiver: BroadcastReceiver? = null
 
-    /** 是否还挂在前台（stopForeground 之后不再重发通知） */
+    /**
+     * 是否已挂上前台服务。
+     *
+     * 只在「用户主动停止服务」时才会被置回 false —— 平时无论哪个通知档位都保持 true。
+     * 见 [applyStateNotification]：一旦中途掉出前台，Android 12+ 就不让再进来了。
+     */
     @Volatile
     private var foreground = false
 
@@ -152,11 +158,9 @@ class MqttService : Service(), MqttCallbackExtended {
         MqttService.state = "Connecting"
         running = true
         notifier.ensureChannels(prefs)
-        startForeground(
-            Notifier.STATE_NOTIFICATION_ID,
+        enterForeground(
             notifier.buildStateNotification("Connecting", "正在连接…", stateChannel())
         )
-        foreground = true
         registerNetworkCallback()
         broadcastStatus("Connecting")
         connect()
@@ -176,15 +180,9 @@ class MqttService : Service(), MqttCallbackExtended {
                 // 实例被复用（stopSelf 之后很快又来一次 start，onCreate 不会再跑）：
                 // 必须重新挂回前台，否则 startForegroundService 会在 5 秒后
                 // 判定「没有调用 startForeground」而直接崩溃。
-                // 该档位若要求不显示，紧接着的 applyStateNotification() 会把它撤掉。
-                try {
-                    startForeground(
-                        Notifier.STATE_NOTIFICATION_ID,
-                        notifier.buildStateNotification(state, lastDetail, stateChannel())
-                    )
-                    foreground = true
-                } catch (_: Exception) {
-                }
+                enterForeground(
+                    notifier.buildStateNotification(state, lastDetail, stateChannel())
+                )
             }
         }
 
@@ -269,7 +267,11 @@ class MqttService : Service(), MqttCallbackExtended {
                 isAutomaticReconnect = false
                 isCleanSession = true
                 connectionTimeout = 20
-                keepAliveInterval = 300
+                // 心跳间隔。原来取 300s，正好和运营商 NAT 的空闲回收时间撞在一起：
+                // NAT 先把映射表项丢掉，我们的 PINGREQ 发进黑洞，要到 1.5×300=450s
+                // 之后 Paho 才判定超时，中间最长 7 分半是「假死」。
+                // 改成 120s：每两分钟一次心跳能持续刷新 NAT 映射，最长失联窗口压到 3 分钟。
+                keepAliveInterval = 120
                 maxInflight = 100
                 if (t.tls) {
                     val sf = buildSocketFactory(t)
@@ -475,8 +477,9 @@ class MqttService : Service(), MqttCallbackExtended {
     /**
      * 按当前「状态通知频道」设置，选出这条通知该走哪个 channel。
      *
-     * 注意：这里只管「要显示时用哪个通道、响不响」，不负责「显不显示」——
-     * 隐藏逻辑在 [shouldHideStateNotification]。
+     * 注意：这里只管「用哪个通道、响不响」，**不管显不显示**——
+     * 前台服务的那条通知必须一直挂着（见 [applyStateNotification] 的说明）。
+     * 想让它从通知栏消失，唯一合法的办法是用户自己在系统设置里把该通道关掉。
      *
      *  - [Notifier.CH_STATE]       会响铃（断开时提醒）
      *  - [Notifier.CH_STATE_LOW]   无声、不亮屏，状态栏留图标
@@ -496,22 +499,66 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     /**
-     * 是否要**完全不占通知栏**（还原原版 `com.android.pushme` 的行为）。
+     * 挂上前台服务。
      *
-     * 原版是没有前台服务的普通 Service，所以「限断」下连接正常时它什么都不发：
-     *   if (mode == "限断" && state == "Connected") { cancel(1); return; }
-     * 本版为了后台存活加了前台服务，于是系统强制挂一条通知。要还原原版效果，
-     * 只能在该隐藏的时候主动 `stopForeground(STOP_FOREGROUND_REMOVE)` 把前台身份摘掉。
-     *
-     * 代价（必须让用户知道）：摘掉前台身份后，进程退回普通后台服务优先级，
-     * 系统在内存紧张或省电策略下可能回收 —— 原版一直是这个代价。
+     * ⚠️ Android 14+ 起 `startForeground` 必须带服务类型，否则抛
+     * `MissingForegroundServiceTypeException`；类型取 manifest 声明的 `specialUse`
+     * （不能用 `dataSync`：API 35 起 dataSync 前台服务累计跑满 6 小时会被系统强制停止）。
      */
-    private fun shouldHideStateNotification(): Boolean = when (prefs.channel) {
-        // 连接正常 → 通知栏一条都不留；连接中/断开 → 照常显示（断开要提醒）
-        "限断", "仅断开时提醒" -> state == "Connected"
-        // 关闭 → 永远不显示，断开也不提醒
-        "关闭" -> true
-        else -> false
+    private fun enterForeground(n: android.app.Notification): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    Notifier.STATE_NOTIFICATION_ID,
+                    n,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(Notifier.STATE_NOTIFICATION_ID, n)
+            }
+            foreground = true
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "startForeground failed: ${e.javaClass.simpleName}")
+            false
+        }
+    }
+
+    /**
+     * 按当前设置重发状态通知。
+     *
+     * ⚠️⚠️ 这里**绝对不能** `stopForeground` —— 这是上一版最大的坑。
+     *
+     * 「限断」档曾经在连接正常时用 `stopForeground(STOP_FOREGROUND_REMOVE)` 把通知撤掉，
+     * 服务于是退回普通后台优先级。之后一旦断线要重连，Android 12+ **禁止后台进程再进入前台**，
+     * `startForeground` 抛 `ForegroundServiceStartNotAllowedException`，只能退化成普通 notify，
+     * 于是永远回不到前台 → 被系统冻结/限流 → keepalive 停止 → broker 断开 → 重连又失败，死循环。
+     * 这正是「给了电池白名单、锁了后台，切后台一会儿还是断」的原因：
+     * 电池白名单只豁免 Doze 与省电策略，**不豁免后台启动前台服务的限制**。
+     *
+     * 正确做法：前台服务自始至终挂着，靠「换成不响的通道」来降低打扰；
+     * 要让通知栏彻底一条都不留，由用户到系统设置里把该通知通道关掉——
+     * 那时前台服务仍在运行（进程仍受保护），只是通知不再显示。
+     */
+    private fun applyStateNotification() {
+        if (stopping || !alive) return
+
+        val ch = stateChannel()
+        // 状态发生跃变才允许响铃；同一状态反复重连失败只更新文案，避免连环响
+        val changed = state != lastPostedState
+        lastPostedState = state
+        val alert = changed && ch == Notifier.CH_STATE
+        Log.i(TAG, "post state=$state ch=$ch fg=$foreground alert=$alert")
+        val n = notifier.buildStateNotification(state, lastDetail, ch, alertOnlyOnce = !alert)
+
+        if (enterForeground(n)) return
+
+        // 极少见：从后台被拒（如刚被系统 thaw 时）。退化成普通通知，等下次状态变化再试。
+        try {
+            androidx.core.app.NotificationManagerCompat.from(this)
+                .notify(Notifier.STATE_NOTIFICATION_ID, n)
+        } catch (_: Exception) {
+        }
     }
 
     /** 是否处于静音时段（start~end，跨零点也成立） */
@@ -530,57 +577,6 @@ class MqttService : Service(), MqttCallbackExtended {
         notifier.ensureChannels(prefs)
         applyStateNotification()
         broadcastStatus(state)
-    }
-
-    /**
-     * 按当前设置重发状态通知，或者按需把它彻底撤掉。
-     *
-     * 走 startForeground 而不是 notify：只有 startForeground 才能保证前台服务
-     * 自己挂的那条通知换了 channel（Android 12+ 上对已发布的前台通知，
-     * 单独 notify 同一个 id 有概率不生效，表现就是「设置改了但通知栏没变」）。
-     */
-    private fun applyStateNotification() {
-        if (stopping || !alive) return
-
-        // 该隐藏时：摘掉前台身份 + 取消通知，服务本身继续跑（原版就是这么做的）
-        if (shouldHideStateNotification()) {
-            if (foreground) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                foreground = false
-            }
-            try {
-                androidx.core.app.NotificationManagerCompat.from(this)
-                    .cancel(Notifier.STATE_NOTIFICATION_ID)
-            } catch (_: Exception) {
-            }
-            lastPostedState = state
-            Log.i(TAG, "hide state notification (state=$state mode=${prefs.channel})")
-            return
-        }
-
-        val ch = stateChannel()
-        // 状态发生跃变才允许响铃；同一状态反复重连失败只更新文案，避免连环响
-        val changed = state != lastPostedState
-        lastPostedState = state
-        val alert = changed && ch == Notifier.CH_STATE
-        Log.i(TAG, "post state=$state ch=$ch fg=$foreground alert=$alert")
-        val n = notifier.buildStateNotification(state, lastDetail, ch, alertOnlyOnce = !alert)
-
-        // 每次都先尝试挂回前台：之前可能因为「隐藏」被 stopForeground 摘掉过。
-        // Android 12+ 从后台重新进前台可能被拒（ForegroundServiceStartNotAllowedException），
-        // 那种情况退化为普通 notify —— 通知照发，只是少了前台保护。
-        try {
-            startForeground(Notifier.STATE_NOTIFICATION_ID, n)
-            foreground = true
-            return
-        } catch (e: Exception) {
-            Log.w(TAG, "startForeground failed: ${e.javaClass.simpleName}, fallback to notify")
-        }
-        try {
-            androidx.core.app.NotificationManagerCompat.from(this)
-                .notify(Notifier.STATE_NOTIFICATION_ID, n)
-        } catch (_: Exception) {
-        }
     }
 
     private fun updateStateText() {

@@ -5,7 +5,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
@@ -39,11 +39,21 @@
             </intent-filter>
         </activity>
 
+        <!--
+          foregroundServiceType 用 specialUse，不用 dataSync：
+          Android 15（API 35）起，targetSdk>=35 的应用里 dataSync 前台服务累计跑满
+          6 小时会被系统强制停止（onTimeout），对常驻推送是致命的。
+          specialUse 没有时长上限，正是为「不属于其他分类的持续连接」准备的类型。
+        -->
         <service
             android:name=".MqttService"
             android:exported="false"
             android:stopWithTask="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="persistent_mqtt_push_connection" />
+        </service>
 
         <receiver
             android:name=".NotificationActionReceiver"

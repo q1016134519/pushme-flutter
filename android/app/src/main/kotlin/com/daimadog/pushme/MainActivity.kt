@@ -298,13 +298,22 @@ class MainActivity : FlutterActivity() {
             "notification" -> Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
                 putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
             }
-            // 直达「状态通知（静默）」通道设置：这是唯一能把状态栏图标真正去掉的入口，
-            // 用户在系统设置里把该通道重要性改为「无」即可。
+            // 直达「状态通知」那条通道的设置页。
+            // 这是唯一能把状态栏条目真正去掉的入口——而且去掉之后前台服务照旧运行，
+            // 进程保护一点不减，只是通知不再显示（见 MqttService.applyStateNotification）。
             "channel" -> {
-                // 直接进本应用的「通知类别」列表：静音档用 StateLowChannel、
-                // 限静档可能落在任一条状态通道上，指定单个 channelId 反而会跳错。
-                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
-                    putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                val chId = when (prefs.channel) {
+                    "静音" -> Notifier.CH_STATE_LOW
+                    "限断", "仅断开时提醒", "关闭" -> Notifier.CH_STATE_QUIET
+                    else -> Notifier.CH_STATE
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+                        putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                        putExtra(Settings.EXTRA_CHANNEL_ID, chId)
+                    }
+                } else {
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
                 }
             }
             "app" -> Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
