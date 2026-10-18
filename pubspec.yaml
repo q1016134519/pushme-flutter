@@ -1,0 +1,29 @@
+name: pushme
+description: "PushMe - Flutter 重构版消息通知客户端"
+publish_to: 'none'
+version: 5.1.0+51
+
+environment:
+  # 放宽下限，使本地 SDK 与 GitHub Actions 上的 stable 通道都能编译
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  markdown: ^7.3.1
+  flutter_widget_from_html_core: ^0.17.4
+  url_launcher: ^6.3.3
+  intl: ^0.20.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/seed/

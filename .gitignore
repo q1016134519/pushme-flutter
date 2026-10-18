@@ -1,0 +1,30 @@
+# ===== Flutter / Dart =====
+.dart_tool/
+.packages
+build/
+build*/          # 历史遗留的 build.old / build.gone 等目录
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+
+# ===== Android =====
+android/local.properties
+android/.gradle/
+android/app/build/
+android/.cxx/
+android/captures/
+android/key.properties
+*.jks
+*.keystore
+
+# ===== 私有数据（不随代码分发）=====
+assets/seed/*.db
+
+# ===== IDE =====
+.idea/
+.vscode/
+
+# ===== 构建产物 / 日志 =====
+*.apk
+*.aab
+*.log
