@@ -301,14 +301,24 @@ class MqttService : Service(), MqttCallbackExtended {
         }
     }
 
+    /** 把 Paho / 网络异常翻译成用户看得懂的文案（会直接显示在通知栏正文里） */
     private fun friendlyError(e: Exception): String {
-        val code = (e as? org.eclipse.paho.client.mqttv3.MqttException)?.reasonCode
-        return when {
-            code == 32000 -> "连接超时"
-            e is java.net.SocketTimeoutException -> "连接超时"
-            e.message.isNullOrBlank() -> "连接失败"
-            else -> e.message!!
+        if (e is java.net.SocketTimeoutException) return "连接超时"
+        val me = e as? org.eclipse.paho.client.mqttv3.MqttException
+        if (me != null) {
+            return when (me.reasonCode) {
+                32000 -> "连接超时"
+                32103 -> "服务器不可达"
+                32104 -> "服务器无响应"
+                32105, 32106, 32107, 32108 -> "服务器拒绝连接"
+                32109, 32110 -> "连接被中断"
+                else -> {
+                    val m = me.message
+                    if (m.isNullOrBlank() || m == "MqttException") "连接失败（${me.reasonCode}）" else m
+                }
+            }
         }
+        return e.message?.takeIf { it.isNotBlank() } ?: "连接失败"
     }
 
     private fun formatHost(host: String): String {

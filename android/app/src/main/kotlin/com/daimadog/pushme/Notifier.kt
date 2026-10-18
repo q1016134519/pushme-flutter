@@ -20,8 +20,17 @@ class Notifier(private val ctx: Context) {
     companion object {
         const val CH_MAIN = "MainChannel"
 
-        /** 状态通道：会响铃，用于「断开时提醒」 */
-        const val CH_STATE = "StateChannel"
+        /**
+         * 状态通道：会响铃，用于「断开时提醒」。
+         *
+         * ⚠️ 坑：NotificationChannel 的 **importance / sound / vibration 在创建那一刻就被系统固化**，
+         * 之后应用再怎么 createNotificationChannel 改都不会生效（只有用户能在系统设置里改）。
+         * `dumpsys notification` 里体现为 `mOriginalImp` 永远是首次声明的值。
+         * 所以这个 id 必须是「从未以低重要性创建过」的新名字 —— 历史上叫 StateChannel 的那个
+         * 已经被以 IMPORTANCE_MIN 建过（mOriginalImp=1），永久停在 LOW（无声），只能弃用。
+         * 若以后要再调重要性，请再换新 id，而不是改这里的常量值。
+         */
+        const val CH_STATE = "StateAlertChannel"
 
         /** 低打扰通道：无声、不亮屏，状态栏保留图标（本来就是 LOW，不受地板规则影响） */
         const val CH_STATE_LOW = "StateLowChannel"
@@ -62,12 +71,22 @@ class Notifier(private val ctx: Context) {
         }
         nm.createNotificationChannel(main)
 
-        // 状态通道：重要性在 channel 创建后「只能升不能降」，所以不能靠改重要性来
+        // 状态通道：重要性在 channel 创建后「应用侧完全改不动」，所以不能靠改重要性来
         // 切换打扰级别 —— 必须用不同的 channelId。三个通道各固定一个重要性，
         // 运行时按设置「换通道」，而不是「改通道」。
-        val state = NotificationChannel(CH_STATE, "状态通知", NotificationManager.IMPORTANCE_DEFAULT).apply {
-            description = "推送服务连接状态（会响铃提醒）"
+        //
+        // 这里显式 setSound：IMPORTANCE_DEFAULT 若不写 sound，层里可能落成 null（无声），
+        // 那就又变成「说好会响其实不响」。
+        val state = NotificationChannel(
+            CH_STATE, "状态通知", NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "推送服务连接状态（断开时响铃提醒）"
             setShowBadge(false)
+            setSound(
+                android.provider.Settings.System.DEFAULT_NOTIFICATION_URI,
+                Notification.AUDIO_ATTRIBUTES_DEFAULT
+            )
+            enableVibration(true)
         }
         nm.createNotificationChannel(state)
 
@@ -94,6 +113,10 @@ class Notifier(private val ctx: Context) {
             setSound(null, null)
         }
         nm.createNotificationChannel(stateQuiet)
+
+        // 清掉历史遗留通道：旧版的 "StateChannel" 当初以 IMPORTANCE_MIN 创建，
+        // 已被系统抬到 LOW 且改不回来，留着只会在系统设置里多出一个永远不响的「状态通知」。
+        runCatching { nm.deleteNotificationChannel("StateChannel") }
     }
 
     private fun channelFor(name: String, prefs: Prefs): String {
