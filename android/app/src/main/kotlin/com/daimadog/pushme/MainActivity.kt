@@ -298,6 +298,21 @@ class MainActivity : FlutterActivity() {
             "notification" -> Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
                 putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
             }
+            // 直达「状态通知（静默）」通道设置：这是唯一能把状态栏图标真正去掉的入口，
+            // 用户在系统设置里把该通道重要性改为「无」即可。
+            "channel" -> {
+                val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+                        putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                        putExtra(Settings.EXTRA_CHANNEL_ID, Notifier.CH_STATE_QUIET)
+                    }
+                } else {
+                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                        putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                    }
+                }
+                intent
+            }
             "app" -> Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
             "battery" -> Intent(
                 Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,

@@ -61,6 +61,11 @@ class MqttService : Service(), MqttCallbackExtended {
         var connectedAt: Long = 0L
             private set
 
+        /** 服务实例是否已存在（避免改设置时用 startService 把没跑的服务拉起来） */
+        @Volatile
+        var running: Boolean = false
+            private set
+
         fun start(ctx: Context) {
             val i = Intent(ctx, MqttService::class.java).setAction(ACTION_START)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
@@ -75,8 +80,14 @@ class MqttService : Service(), MqttCallbackExtended {
             ctx.startService(Intent(ctx, MqttService::class.java).setAction(ACTION_RECONNECT))
         }
 
-        /** 设置页改了通知频道后调用：不用重连，立刻按新策略重发状态通知 */
+        /**
+         * 设置页改了通知频道后调用：按新策略重发状态通知，不重连、不打断连接。
+         *
+         * 只在服务已运行时才发：否则 startService 会把一个本已停止的服务重新拉起来，
+         * 用户会看到「只是改了个通知设置，服务却自己启动了」。
+         */
         fun refreshNotification(ctx: Context) {
+            if (!running) return
             try {
                 ctx.startService(Intent(ctx, MqttService::class.java).setAction(ACTION_REFRESH))
             } catch (_: Exception) {
@@ -116,6 +127,7 @@ class MqttService : Service(), MqttCallbackExtended {
         notifier = Notifier(this)
         db = MessageDb.get(this)
         MqttService.state = "Connecting"
+        running = true
         notifier.ensureChannels(prefs)
         startForeground(
             Notifier.STATE_NOTIFICATION_ID,
@@ -156,6 +168,7 @@ class MqttService : Service(), MqttCallbackExtended {
 
     override fun onDestroy() {
         stopping = true
+        running = false
         disconnect()
         foreground = false
         unregisterNetworkCallback()
@@ -334,13 +347,17 @@ class MqttService : Service(), MqttCallbackExtended {
      * 按当前「状态通知频道」设置，选出这条通知该走哪个 channel。
      *
      * 系统硬限制：这是前台服务，Android 强制要求挂一个通知，**无法真正隐藏**。
-     * 所以低打扰只能靠切 channel 实现：
-     *  - [Notifier.CH_STATE]       正常，会响铃（断开时提醒）
-     *  - [Notifier.CH_STATE_LOW]   无声，但状态栏留图标
-     *  - [Notifier.CH_STATE_QUIET] 静默，不进状态栏，下拉后在「静默通知」区
+     * 而且 NotificationManagerService 有一条「重要性地板」：
+     *   isFgsOrUij() && 通道重要性未被用户锁定 && importance <= MIN
+     *     → 强制 channel.setImportance(LOW)
+     * 所以 MIN 通道挂在 FGS 上会被抬到 LOW，状态栏图标照旧。
      *
-     * 注意不能靠改 Channel 的 importance 来降级 —— importance 创建后只升不降，
-     * 必须换 channelId。
+     * 结论：应用侧能做的只有「不响铃、不亮屏、不弹横幅」，图标是否消失取决于用户
+     * 在系统通知设置里把该通道调成「无」。设置页提供了直达入口。
+     *
+     *  - [Notifier.CH_STATE]       会响铃（断开时提醒）
+     *  - [Notifier.CH_STATE_LOW]   无声、不亮屏，状态栏留图标
+     *  - [Notifier.CH_STATE_QUIET] 静默通道，尽量低调
      */
     private fun stateChannel(): String = when (prefs.channel) {
         // 仅断开时提醒：只有「真的断了」才回到会响铃的通道；

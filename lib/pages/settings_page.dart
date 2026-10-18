@@ -95,8 +95,8 @@ class _SettingsPageState extends State<SettingsPage> {
       '通知': '常驻状态通知，断开时响铃提醒',
       '限静': '静音时段内不响铃，状态栏仍显示',
       '静音': '状态通知不出声，状态栏仍显示',
-      '限断': '连接正常时收起，仅在断开时提醒',
-      '关闭': '尽力隐藏，仅通知栏下拉后可见',
+      '限断': '连接正常时静默，断开才响铃提醒',
+      '关闭': '不响铃不亮屏，尽量低调（图标无法去除）',
     };
     final current = _s.str('channel', '限断');
     final picked = await showModalBottomSheet<String>(
@@ -424,6 +424,13 @@ class _SettingsPageState extends State<SettingsPage> {
                         title: '状态通知频道',
                         subtitle: _s.str('channel', '限断'),
                         onTap: _pickChannel,
+                      ),
+                      const Divider(height: 1),
+                      SettingTile(
+                        icon: Icons.visibility_off_rounded,
+                        title: '隐藏状态栏图标',
+                        subtitle: '前台服务必须挂通知，只能去系统设置把本通道调成「无」',
+                        onTap: () => NativeApi.open('channel'),
                       ),
                       const Divider(height: 1),
                       SettingTile(

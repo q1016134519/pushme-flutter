@@ -20,17 +20,28 @@ class Notifier(private val ctx: Context) {
     companion object {
         const val CH_MAIN = "MainChannel"
 
-        /** 状态通道：正常打扰（可响铃/亮屏），用于「断开时提醒」 */
+        /** 状态通道：会响铃，用于「断开时提醒」 */
         const val CH_STATE = "StateChannel"
 
-        /** 低打扰通道：无声、不亮屏，但状态栏仍留图标 */
+        /** 低打扰通道：无声、不亮屏，状态栏保留图标（本来就是 LOW，不受地板规则影响） */
         const val CH_STATE_LOW = "StateLowChannel"
 
         /**
-         * 静默通道：IMPORTANCE_MIN，不占状态栏图标、无声、不亮屏，
-         * 只在通知栏下拉后的「静默通知」区可见 —— 前台服务能做到的最低打扰程度。
+         * 静默通道：声明为 IMPORTANCE_MIN，无声、不亮屏、排在下拉栏底部。
+         *
+         * ⚠️ 重要：Android 对前台服务通知有一条「重要性地板」——
+         * NotificationManagerService 在入队时执行：
+         *   if (notification.isFgsOrUij()
+         *       && (channel.getUserLockedFields() & USER_LOCKED_IMPORTANCE) == 0
+         *       && r.getImportance() <= IMPORTANCE_MIN) {
+         *       channel.setImportance(IMPORTANCE_LOW)   // 强制抬到 LOW
+         *   }
+         * 也就是说，前台服务挂 MIN 通道会被系统自动抬到 LOW，**状态栏图标删不掉**。
+         * 这里仍按 MIN 声明，是因为一旦用户在系统设置里把该通道重要性锁定为
+         * 「无」，地板条件不成立，MIN 就会被真正尊重（那时状态栏图标才会消失）。
          */
         const val CH_STATE_QUIET = "StateQuietChannel"
+
         const val STATE_NOTIFICATION_ID = 1
         const val ACTION_MARK_READ = "com.daimadog.pushme.MARK_READ"
         const val ACTION_DELETE = "com.daimadog.pushme.DELETE_MESSAGE"
@@ -71,10 +82,12 @@ class Notifier(private val ctx: Context) {
         }
         nm.createNotificationChannel(stateLow)
 
+        // 静默通道。声明 IMPORTANCE_MIN；但前台服务会被系统抬到 LOW（见 CH_STATE_QUIET 注释）。
+        // 用户若在系统设置中把本通道重要性锁为「无」，则 MIN 生效、状态栏图标消失。
         val stateQuiet = NotificationChannel(
             CH_STATE_QUIET, "状态通知（静默）", NotificationManager.IMPORTANCE_MIN
         ).apply {
-            description = "推送服务运行中，仅在通知栏静默区可见"
+            description = "推送服务运行中，尽量不打扰（可在系统通知设置里进一步调低）"
             setShowBadge(false)
             enableVibration(false)
             enableLights(false)
@@ -177,7 +190,16 @@ class Notifier(private val ctx: Context) {
         channelId: String = CH_STATE,
         alertOnlyOnce: Boolean = true
     ): Notification {
+        // 通知自身的 priority 必须与所选通道的重要性一致，否则会「就高」——
+        // 例如静默通道(IMPORTANCE_MIN)配 PRIORITY_LOW，系统会把实际重要性抬到 LOW，
+        // 结果静默通道照样在状态栏留图标。
+        val priority = when (channelId) {
+            CH_STATE_QUIET -> NotificationCompat.PRIORITY_MIN
+            CH_STATE_LOW -> NotificationCompat.PRIORITY_LOW
+            else -> NotificationCompat.PRIORITY_DEFAULT
+        }
         val silent = channelId != CH_STATE
+
         val openIntent = Intent(ctx, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -194,9 +216,7 @@ class Notifier(private val ctx: Context) {
             .setOnlyAlertOnce(alertOnlyOnce)
             .setShowWhen(false)
             .setSilent(silent)
-            .setPriority(
-                if (silent) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_DEFAULT
-            )
+            .setPriority(priority)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(openPi)
             .setVisibility(NotificationCompat.VISIBILITY_SECRET)
