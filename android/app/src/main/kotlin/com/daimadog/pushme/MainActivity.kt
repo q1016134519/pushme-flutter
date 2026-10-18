@@ -117,7 +117,12 @@ class MainActivity : FlutterActivity() {
                     Prefs.MQTT_TLS, Prefs.MQTT_CERT, Prefs.PUSH_KEY -> {
                         if (prefs.serviceEnabled) MqttService.reconnect(this)
                     }
-                    Prefs.CHANNEL -> Notifier(this).ensureChannels(prefs)
+                    Prefs.CHANNEL, Prefs.CHANNEL_START, Prefs.CHANNEL_END -> {
+                        // 通道要重建；同时让前台服务按新策略立刻重发状态通知，
+                        // 否则用户改完设置通知栏毫无变化（挂到下次状态跃变才生效）
+                        Notifier(this).ensureChannels(prefs)
+                        MqttService.refreshNotification(this)
+                    }
                 }
                 result.success(true)
             }

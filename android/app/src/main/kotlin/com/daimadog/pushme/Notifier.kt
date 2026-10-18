@@ -19,7 +19,18 @@ class Notifier(private val ctx: Context) {
 
     companion object {
         const val CH_MAIN = "MainChannel"
+
+        /** 状态通道：正常打扰（可响铃/亮屏），用于「断开时提醒」 */
         const val CH_STATE = "StateChannel"
+
+        /** 低打扰通道：无声、不亮屏，但状态栏仍留图标 */
+        const val CH_STATE_LOW = "StateLowChannel"
+
+        /**
+         * 静默通道：IMPORTANCE_MIN，不占状态栏图标、无声、不亮屏，
+         * 只在通知栏下拉后的「静默通知」区可见 —— 前台服务能做到的最低打扰程度。
+         */
+        const val CH_STATE_QUIET = "StateQuietChannel"
         const val STATE_NOTIFICATION_ID = 1
         const val ACTION_MARK_READ = "com.daimadog.pushme.MARK_READ"
         const val ACTION_DELETE = "com.daimadog.pushme.DELETE_MESSAGE"
@@ -40,18 +51,36 @@ class Notifier(private val ctx: Context) {
         }
         nm.createNotificationChannel(main)
 
-        val importance = when (prefs.channel) {
-            "静音" -> NotificationManager.IMPORTANCE_LOW
-            "关闭" -> NotificationManager.IMPORTANCE_MIN
-            else -> NotificationManager.IMPORTANCE_DEFAULT
-        }
-        val state = NotificationChannel(CH_STATE, "状态通知", importance).apply {
-            description = "推送服务连接状态"
+        // 状态通道：重要性在 channel 创建后「只能升不能降」，所以不能靠改重要性来
+        // 切换打扰级别 —— 必须用不同的 channelId。三个通道各固定一个重要性，
+        // 运行时按设置「换通道」，而不是「改通道」。
+        val state = NotificationChannel(CH_STATE, "状态通知", NotificationManager.IMPORTANCE_DEFAULT).apply {
+            description = "推送服务连接状态（会响铃提醒）"
             setShowBadge(false)
-            enableVibration(false)
-            setSound(null, null)
         }
         nm.createNotificationChannel(state)
+
+        val stateLow = NotificationChannel(
+            CH_STATE_LOW, "状态通知（无声）", NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "推送服务连接状态，不发声但保留状态栏图标"
+            setShowBadge(false)
+            enableVibration(false)
+            enableLights(false)
+            setSound(null, null)
+        }
+        nm.createNotificationChannel(stateLow)
+
+        val stateQuiet = NotificationChannel(
+            CH_STATE_QUIET, "状态通知（静默）", NotificationManager.IMPORTANCE_MIN
+        ).apply {
+            description = "推送服务运行中，仅在通知栏静默区可见"
+            setShowBadge(false)
+            enableVibration(false)
+            enableLights(false)
+            setSound(null, null)
+        }
+        nm.createNotificationChannel(stateQuiet)
     }
 
     private fun channelFor(name: String, prefs: Prefs): String {
@@ -136,8 +165,19 @@ class Notifier(private val ctx: Context) {
         )
     }
 
-    /** 常驻状态通知 */
-    fun buildStateNotification(state: String, detail: String, prefs: Prefs): Notification {
+    /**
+     * 常驻状态通知。
+     *
+     * @param channelId 三选一：[CH_STATE] 正常提醒 / [CH_STATE_LOW] 无声 / [CH_STATE_QUIET] 静默
+     * @param alertOnlyOnce true 时同一条通知的更新不再重复响铃（用于反复重连失败时防轰炸）
+     */
+    fun buildStateNotification(
+        state: String,
+        detail: String,
+        channelId: String = CH_STATE,
+        alertOnlyOnce: Boolean = true
+    ): Notification {
+        val silent = channelId != CH_STATE
         val openIntent = Intent(ctx, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -146,26 +186,33 @@ class Notifier(private val ctx: Context) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val icon = if (state == "Connected") "🟢" else "🔴"
-        val builder = NotificationCompat.Builder(ctx, CH_STATE)
+        val builder = NotificationCompat.Builder(ctx, channelId)
             .setSmallIcon(R.drawable.ic_stat_push)
             .setContentTitle("$icon PushMe $state")
             .setContentText(detail)
             .setOngoing(true)
-            .setOnlyAlertOnce(true)
+            .setOnlyAlertOnce(alertOnlyOnce)
             .setShowWhen(false)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setSilent(silent)
+            .setPriority(
+                if (silent) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_DEFAULT
+            )
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(openPi)
             .setVisibility(NotificationCompat.VISIBILITY_SECRET)
 
-        // 点击可打开设置（长按通知时系统提供）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // 前台服务通知立即展示，避免「已运行但通知迟到」的割裂感
+            builder.setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+
         return builder.build()
     }
 
-    fun notifyState(state: String, detail: String, prefs: Prefs) {
+    fun notifyState(state: String, detail: String, channelId: String = CH_STATE) {
         try {
             NotificationManagerCompat.from(ctx)
-                .notify(STATE_NOTIFICATION_ID, buildStateNotification(state, detail, prefs))
+                .notify(STATE_NOTIFICATION_ID, buildStateNotification(state, detail, channelId))
         } catch (_: Exception) {
         }
     }

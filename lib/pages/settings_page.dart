@@ -92,11 +92,11 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _pickChannel() async {
     const options = <String, String>{
-      '通知': '常驻状态通知，断开时提醒',
-      '限静': '静音时段内不响铃',
-      '静音': '状态通知不发声',
-      '限断': '仅在连接断开时提醒',
-      '关闭': '不显示状态通知',
+      '通知': '常驻状态通知，断开时响铃提醒',
+      '限静': '静音时段内不响铃，状态栏仍显示',
+      '静音': '状态通知不出声，状态栏仍显示',
+      '限断': '连接正常时收起，仅在断开时提醒',
+      '关闭': '尽力隐藏，仅通知栏下拉后可见',
     };
     final current = _s.str('channel', '限断');
     final picked = await showModalBottomSheet<String>(

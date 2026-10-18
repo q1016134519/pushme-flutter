@@ -24,6 +24,7 @@ import java.io.ByteArrayInputStream
 import java.security.KeyStore
 import java.security.cert.CertificateFactory
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import javax.net.ssl.SSLContext
@@ -41,9 +42,15 @@ class MqttService : Service(), MqttCallbackExtended {
         const val ACTION_START = "com.daimadog.pushme.START"
         const val ACTION_STOP = "com.daimadog.pushme.STOP"
         const val ACTION_RECONNECT = "com.daimadog.pushme.RECONNECT"
+        const val ACTION_REFRESH = "com.daimadog.pushme.REFRESH_NOTIFICATION"
 
         @Volatile
         var state: String = "Closed"
+            private set
+
+        /** 最近一次的详情文案，供「改设置后立即刷新通知」使用 */
+        @Volatile
+        var lastDetail: String = "正在连接…"
             private set
 
         @Volatile
@@ -67,6 +74,14 @@ class MqttService : Service(), MqttCallbackExtended {
         fun reconnect(ctx: Context) {
             ctx.startService(Intent(ctx, MqttService::class.java).setAction(ACTION_RECONNECT))
         }
+
+        /** 设置页改了通知频道后调用：不用重连，立刻按新策略重发状态通知 */
+        fun refreshNotification(ctx: Context) {
+            try {
+                ctx.startService(Intent(ctx, MqttService::class.java).setAction(ACTION_REFRESH))
+            } catch (_: Exception) {
+            }
+        }
     }
 
     private lateinit var prefs: Prefs
@@ -83,14 +98,30 @@ class MqttService : Service(), MqttCallbackExtended {
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var cfgReceiver: BroadcastReceiver? = null
 
+    /** 是否还挂在前台（stopForeground 之后不再重发通知） */
+    @Volatile
+    private var foreground = false
+
+    /** 正在停止：阻止 setState 把通知又贴回去 */
+    @Volatile
+    private var stopping = false
+
+    /** 上一次真正发布出去的状态，用于判断「状态是否发生跃变」以决定要不要响铃 */
+    private var lastPostedState: String = ""
+
     override fun onCreate() {
         super.onCreate()
         AppContextHolder.context = applicationContext
         prefs = Prefs(this)
         notifier = Notifier(this)
         db = MessageDb.get(this)
+        MqttService.state = "Connecting"
         notifier.ensureChannels(prefs)
-        startForeground(Notifier.STATE_NOTIFICATION_ID, notifier.buildStateNotification("Connecting", "正在连接…", prefs))
+        startForeground(
+            Notifier.STATE_NOTIFICATION_ID,
+            notifier.buildStateNotification("Connecting", "正在连接…", stateChannel())
+        )
+        foreground = true
         registerNetworkCallback()
         broadcastStatus("Connecting")
         connect()
@@ -100,7 +131,9 @@ class MqttService : Service(), MqttCallbackExtended {
         when (intent?.action) {
             ACTION_STOP -> {
                 prefs.serviceEnabled = false
+                stopping = true
                 disconnect()
+                foreground = false
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
@@ -110,6 +143,11 @@ class MqttService : Service(), MqttCallbackExtended {
                 retry = 0
                 connect()
             }
+            ACTION_REFRESH -> {
+                // 频道设置变了：重建通道并按新策略重发，不打断连接
+                notifier.ensureChannels(prefs)
+                applyStateNotification()
+            }
         }
         return START_STICKY
     }
@@ -117,7 +155,9 @@ class MqttService : Service(), MqttCallbackExtended {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        stopping = true
         disconnect()
+        foreground = false
         unregisterNetworkCallback()
         broadcastStatus("Closed")
         super.onDestroy()
@@ -290,30 +330,83 @@ class MqttService : Service(), MqttCallbackExtended {
 
     // ---------------- 状态 ----------------
 
+    /**
+     * 按当前「状态通知频道」设置，选出这条通知该走哪个 channel。
+     *
+     * 系统硬限制：这是前台服务，Android 强制要求挂一个通知，**无法真正隐藏**。
+     * 所以低打扰只能靠切 channel 实现：
+     *  - [Notifier.CH_STATE]       正常，会响铃（断开时提醒）
+     *  - [Notifier.CH_STATE_LOW]   无声，但状态栏留图标
+     *  - [Notifier.CH_STATE_QUIET] 静默，不进状态栏，下拉后在「静默通知」区
+     *
+     * 注意不能靠改 Channel 的 importance 来降级 —— importance 创建后只升不降，
+     * 必须换 channelId。
+     */
+    private fun stateChannel(): String = when (prefs.channel) {
+        // 仅断开时提醒：只有「真的断了」才回到会响铃的通道；
+        // 连接中 / 已连接 / 未配置 全部静默，避免开机后先响一声
+        "限断", "仅断开时提醒" ->
+            if (state == "Disconnected") Notifier.CH_STATE else Notifier.CH_STATE_QUIET
+        // 不显示状态通知：前台服务无法真正隐藏，退化为静默常驻
+        "关闭" -> Notifier.CH_STATE_QUIET
+        // 静音：不出声，但保留状态栏图标
+        "静音" -> Notifier.CH_STATE_LOW
+        // 限静：仅静音时段内不打扰
+        "限静" -> if (inQuietHours()) Notifier.CH_STATE_LOW else Notifier.CH_STATE
+        else -> Notifier.CH_STATE
+    }
+
+    /** 是否处于静音时段（start~end，跨零点也成立） */
+    private fun inQuietHours(): Boolean {
+        val start = prefs.channelStart
+        val end = prefs.channelEnd
+        if (start == end) return false
+        val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        return if (start < end) h in start until end else (h >= start || h < end)
+    }
+
     private fun setState(state: String, detail: String) {
         MqttService.state = state
+        MqttService.lastDetail = detail
         notifier.ensureChannels(prefs)
-        when (prefs.channel) {
-            "关闭", "静音" -> notifier.notifyState(state, detail, prefs)
-            "限断" -> {
-                if (state != "Connected") notifier.notifyState(state, detail, prefs)
-                else notifier.notifyState(state, detail, prefs)
-            }
-            else -> {
-                // 通知 / 限静：始终显示；限静时在静音时段内静音（由通道重要性控制）
-                notifier.notifyState(state, detail, prefs)
+        applyStateNotification()
+        broadcastStatus(state)
+    }
+
+    /**
+     * 按当前设置重发状态通知。
+     *
+     * 走 startForeground 而不是 notify：只有 startForeground 才能保证前台服务
+     * 自己挂的那条通知换了 channel（Android 12+ 上对已发布的前台通知，
+     * 单独 notify 同一个 id 有概率不生效，表现就是「设置改了但通知栏没变」）。
+     */
+    private fun applyStateNotification() {
+        if (stopping) return
+        val ch = stateChannel()
+        // 状态发生跃变才允许响铃；同一状态反复重连失败只更新文案，避免连环响
+        val changed = state != lastPostedState
+        lastPostedState = state
+        val alert = changed && ch == Notifier.CH_STATE
+        val n = notifier.buildStateNotification(state, lastDetail, ch, alertOnlyOnce = !alert)
+        if (foreground) {
+            try {
+                startForeground(Notifier.STATE_NOTIFICATION_ID, n)
+                return
+            } catch (_: Exception) {
+                // 前台状态被系统回收过，退化为普通 notify
             }
         }
-        broadcastStatus(state)
+        try {
+            androidx.core.app.NotificationManagerCompat.from(this)
+                .notify(Notifier.STATE_NOTIFICATION_ID, n)
+        } catch (_: Exception) {
+        }
     }
 
     private fun updateStateText() {
         val count = db?.todayCount() ?: 0
-        notifier.notifyState(
-            state,
-            "今日已收 $count 条 · $sinceText 连接",
-            prefs
-        )
+        MqttService.lastDetail = "今日已收 $count 条 · $sinceText 连接"
+        applyStateNotification()
     }
 
     private fun broadcastStatus(state: String) {
