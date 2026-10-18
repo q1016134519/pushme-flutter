@@ -117,6 +117,27 @@ class MqttService : Service(), MqttCallbackExtended {
     @Volatile
     private var stopping = false
 
+    /**
+     * 本实例是否仍然有效。onDestroy 置 false 后，残留线程（例如卡在 TCP 上的连接线程）
+     * 即使随后抛异常也不会再回来改状态、改通知。
+     */
+    @Volatile
+    private var alive = false
+
+    /**
+     * 连接尝试的序号。每次发起连接 +1，[disconnect] 也会 +1。
+     * 线程回到主流程时若发现序号已变，说明它属于一次已经作废的尝试，直接丢弃结果。
+     */
+    @Volatile
+    private var attempt = 0
+
+    /** 本次连接尝试的开始时间，用于判断「是不是卡死了」 */
+    @Volatile
+    private var connectingSince = 0L
+
+    /** 等待 CONNACK 的上限。超过就判定失败，避免通知栏永远停在「正在连接…」 */
+    private val connectTimeoutMs = 20_000L
+
     /** 上一次真正发布出去的状态，用于判断「状态是否发生跃变」以决定要不要响铃 */
     private var lastPostedState: String = ""
 
@@ -126,6 +147,8 @@ class MqttService : Service(), MqttCallbackExtended {
         prefs = Prefs(this)
         notifier = Notifier(this)
         db = MessageDb.get(this)
+        alive = true
+        stopping = false
         MqttService.state = "Connecting"
         running = true
         notifier.ensureChannels(prefs)
@@ -140,11 +163,35 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        val action = intent?.action
+
+        // 任何「重新开始」的动作都必须复位停止标记。
+        // stopSelf() 之后如果很快又来一个 start，系统可能复用同一个实例而不重跑 onCreate，
+        // 于是 stopping 会一直停在 true —— applyStateNotification 被永久拦死，
+        // 表现就是「界面已经显示断开，通知栏却一直停在旧文案」。
+        if (action != ACTION_STOP) {
+            stopping = false
+            alive = true
+            if (!foreground) {
+                // 实例被复用（stopSelf 之后很快又来一次 start，onCreate 不会再跑）：
+                // 必须重新挂回前台，否则 startForegroundService 会在 5 秒后
+                // 判定「没有调用 startForeground」而直接崩溃。
+                startForeground(
+                    Notifier.STATE_NOTIFICATION_ID,
+                    notifier.buildStateNotification(state, lastDetail, stateChannel())
+                )
+                foreground = true
+            }
+        }
+
+        when (action) {
             ACTION_STOP -> {
                 prefs.serviceEnabled = false
-                stopping = true
+                // 先正常收尾：此时 stopping 仍为 false，通知能更新成「Closed」，
+                // 紧接着就被 stopForeground 移除，用户看到的是完整的一次退出而不是半截状态。
                 disconnect()
+                stopping = true
+                alive = false
                 foreground = false
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -167,10 +214,15 @@ class MqttService : Service(), MqttCallbackExtended {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        alive = false
         stopping = true
         running = false
-        disconnect()
+        attempt++          // 让所有在途连接线程的结果作废
+        connecting = false
+        handler.removeCallbacksAndMessages(null)
+        disconnectQuiet()
         foreground = false
+        MqttService.state = "Closed"
         unregisterNetworkCallback()
         broadcastStatus("Closed")
         super.onDestroy()
@@ -179,7 +231,12 @@ class MqttService : Service(), MqttCallbackExtended {
     // ---------------- 连接管理 ----------------
 
     private fun connect() {
-        if (connecting) return
+        if (!alive || stopping) return
+
+        val now = System.currentTimeMillis()
+        // 上一次尝试还没回来：除非它已经明显超过超时时间（底层卡死），否则不叠加新连接
+        if (connecting && now - connectingSince < connectTimeoutMs) return
+
         val t = prefs.activeTarget()
         target = t
         if (t.key.isBlank() || t.host.isBlank()) {
@@ -187,35 +244,71 @@ class MqttService : Service(), MqttCallbackExtended {
             return
         }
         connecting = true
-        Thread {
-            try {
-                disconnectQuiet()
-                val uri = "${if (t.tls) "ssl" else "tcp"}://${formatHost(t.host)}:${t.port}"
-                val c = MqttClient(uri, "me_${t.key}", MemoryPersistence())
-                c.setCallback(this)
-                val opt = MqttConnectOptions().apply {
-                    isAutomaticReconnect = false
-                    isCleanSession = true
-                    connectionTimeout = 20
-                    keepAliveInterval = 300
-                    maxInflight = 100
-                    if (t.tls) {
-                        val sf = buildSocketFactory(t)
-                        if (sf != null) socketFactory = sf
-                    }
+        connectingSince = now
+        val my = ++attempt
+        // 只有从「没在连」的状态进入时才显示「正在连接」。
+        // 失败重连的循环里保持在「已断开」，否则文案会在 Connecting/Disconnected 之间来回跳，
+        // 每跳一次状态就算一次跃变，会把「断开提醒」变成连环响铃。
+        if (MqttService.state != "Disconnected") setState("Connecting", "正在连接…")
+        Thread { doConnect(t, my) }.start()
+    }
+
+    private fun doConnect(t: Prefs.Target, my: Int) {
+        var pending: MqttClient? = null
+        try {
+            disconnectQuiet()
+            val uri = "${if (t.tls) "ssl" else "tcp"}://${formatHost(t.host)}:${t.port}"
+            val cli = MqttClient(uri, "me_${t.key}", MemoryPersistence())
+            pending = cli
+            cli.setCallback(this)
+            val opt = MqttConnectOptions().apply {
+                isAutomaticReconnect = false
+                isCleanSession = true
+                connectionTimeout = 20
+                keepAliveInterval = 300
+                maxInflight = 100
+                if (t.tls) {
+                    val sf = buildSocketFactory(t)
+                    if (sf != null) socketFactory = sf
                 }
-                c.connect(opt)
-                client = c
-                c.subscribe(t.topic, 1)
-                Log.i(TAG, "subscribed ${t.topic} on $uri")
-            } catch (e: Exception) {
-                Log.w(TAG, "connect failed: ${e.message}")
-                setState("Disconnected", e.message ?: "连接失败")
-                scheduleRetry()
-            } finally {
-                connecting = false
             }
-        }.start()
+            // 必须用「带超时的等待」而不是同步 connect()：
+            // Paho 的阻塞式 connect() 内部是 Token.waitForCompletion()（无超时），
+            // 一旦 broker 接受 TCP 却不回 CONNACK（端口填错、被墙、TLS 端口写成明文），
+            // 这个线程会永久挂住，通知栏就永远停在「正在连接…」。
+            cli.connectWithResult(opt).waitForCompletion(connectTimeoutMs)
+            if (my != attempt || !alive) {
+                try {
+                    cli.close(true)
+                } catch (_: Exception) {
+                }
+                return
+            }
+            client = cli
+            cli.subscribe(t.topic, 1)
+            Log.i(TAG, "subscribed ${t.topic} on $uri")
+        } catch (e: Exception) {
+            try {
+                pending?.close(true)
+            } catch (_: Exception) {
+            }
+            if (my != attempt || !alive) return
+            Log.w(TAG, "connect failed: ${e.message}")
+            setState("Disconnected", friendlyError(e))
+            scheduleRetry()
+        } finally {
+            if (my == attempt) connecting = false
+        }
+    }
+
+    private fun friendlyError(e: Exception): String {
+        val code = (e as? org.eclipse.paho.client.mqttv3.MqttException)?.reasonCode
+        return when {
+            code == 32000 -> "连接超时"
+            e is java.net.SocketTimeoutException -> "连接超时"
+            e.message.isNullOrBlank() -> "连接失败"
+            else -> e.message!!
+        }
     }
 
     private fun formatHost(host: String): String {
@@ -272,6 +365,8 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     private fun disconnect() {
+        attempt++          // 作废在途的连接线程，避免它稍后把状态改回 Disconnected
+        connecting = false
         handler.removeCallbacksAndMessages(null)
         disconnectQuiet()
         setState("Closed", "服务已停止")
@@ -280,6 +375,7 @@ class MqttService : Service(), MqttCallbackExtended {
     // ---------------- Paho 回调 ----------------
 
     override fun connectComplete(reconnect: Boolean, serverURI: String?) {
+        if (!alive) return
         retry = 0
         connectedAt = System.currentTimeMillis()
         sinceText = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
@@ -293,6 +389,7 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     override fun connectionLost(cause: Throwable?) {
+        if (!alive) return
         if (cause is org.eclipse.paho.client.mqttv3.MqttException && cause.reasonCode == 32111) {
             // 主动断开，不重连
             return
@@ -302,6 +399,7 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     override fun messageArrived(topic: String?, message: MqttMessage?) {
+        if (!alive) return
         val payload = message?.payload?.toString(Charsets.UTF_8) ?: return
         try {
             handlePayload(payload)
@@ -383,6 +481,7 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     private fun setState(state: String, detail: String) {
+        if (!alive) return
         MqttService.state = state
         MqttService.lastDetail = detail
         notifier.ensureChannels(prefs)
@@ -398,12 +497,13 @@ class MqttService : Service(), MqttCallbackExtended {
      * 单独 notify 同一个 id 有概率不生效，表现就是「设置改了但通知栏没变」）。
      */
     private fun applyStateNotification() {
-        if (stopping) return
+        if (stopping || !alive) return
         val ch = stateChannel()
         // 状态发生跃变才允许响铃；同一状态反复重连失败只更新文案，避免连环响
         val changed = state != lastPostedState
         lastPostedState = state
         val alert = changed && ch == Notifier.CH_STATE
+        Log.i(TAG, "post state=$state ch=$ch fg=$foreground alert=$alert")
         val n = notifier.buildStateNotification(state, lastDetail, ch, alertOnlyOnce = !alert)
         if (foreground) {
             try {
