@@ -95,9 +95,11 @@ class _SettingsPageState extends State<SettingsPage> {
       '通知': '常驻状态通知，断开时响铃提醒',
       '限静': '静音时段内不响铃，状态栏仍显示',
       '静音': '状态通知不出声，状态栏仍显示',
-      '限断': '连接正常时静默，断开才响铃（通知栏必有一条）',
-      '关闭': '不响铃不亮屏，尽量低调（图标无法去除）',
+      '限断': '连接正常时通知栏无任何条目，断开才响铃（同原版）',
+      '关闭': '通知栏始终不显示，断开也不提醒',
     };
+    const warn = '「限断」与「关闭」在隐藏期间不占用前台服务，'
+        '系统省电策略下后台可能被回收。建议在本机设置里把本应用设为「不受限制」。';
     final current = _s.str('channel', '限断');
     final picked = await showModalBottomSheet<String>(
       context: context,
@@ -129,7 +131,13 @@ class _SettingsPageState extends State<SettingsPage> {
                 ),
                 dense: true,
               ),
-            const SizedBox(height: 10),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(18, 2, 18, 10),
+              child: Text(
+                warn,
+                style: TextStyle(fontSize: 11, height: 1.45, color: Colors.grey),
+              ),
+            ),
           ],
         ),
       ),
@@ -429,7 +437,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       SettingTile(
                         icon: Icons.visibility_off_rounded,
                         title: '隐藏状态栏图标',
-                        subtitle: '前台服务必须挂通知，只能去系统设置把本通道调成「无」',
+                        subtitle: '仅「通知 / 静音 / 限静」档需要；限断与关闭本来就不显示',
                         onTap: () => NativeApi.open('channel'),
                       ),
                       const Divider(height: 1),

@@ -12,3 +12,5 @@ GeneratedPluginRegistrant.java
 key.properties
 **/*.keystore
 **/*.jks
+# 例外：CI 与本机共用的调试签名密钥，需入库以保证签名一致
+!app/debug.keystore

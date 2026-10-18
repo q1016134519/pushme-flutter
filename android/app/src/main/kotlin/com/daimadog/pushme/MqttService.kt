@@ -176,11 +176,15 @@ class MqttService : Service(), MqttCallbackExtended {
                 // 实例被复用（stopSelf 之后很快又来一次 start，onCreate 不会再跑）：
                 // 必须重新挂回前台，否则 startForegroundService 会在 5 秒后
                 // 判定「没有调用 startForeground」而直接崩溃。
-                startForeground(
-                    Notifier.STATE_NOTIFICATION_ID,
-                    notifier.buildStateNotification(state, lastDetail, stateChannel())
-                )
-                foreground = true
+                // 该档位若要求不显示，紧接着的 applyStateNotification() 会把它撤掉。
+                try {
+                    startForeground(
+                        Notifier.STATE_NOTIFICATION_ID,
+                        notifier.buildStateNotification(state, lastDetail, stateChannel())
+                    )
+                    foreground = true
+                } catch (_: Exception) {
+                }
             }
         }
 
@@ -471,14 +475,8 @@ class MqttService : Service(), MqttCallbackExtended {
     /**
      * 按当前「状态通知频道」设置，选出这条通知该走哪个 channel。
      *
-     * 系统硬限制：这是前台服务，Android 强制要求挂一个通知，**无法真正隐藏**。
-     * 而且 NotificationManagerService 有一条「重要性地板」：
-     *   isFgsOrUij() && 通道重要性未被用户锁定 && importance <= MIN
-     *     → 强制 channel.setImportance(LOW)
-     * 所以 MIN 通道挂在 FGS 上会被抬到 LOW，状态栏图标照旧。
-     *
-     * 结论：应用侧能做的只有「不响铃、不亮屏、不弹横幅」，图标是否消失取决于用户
-     * 在系统通知设置里把该通道调成「无」。设置页提供了直达入口。
+     * 注意：这里只管「要显示时用哪个通道、响不响」，不负责「显不显示」——
+     * 隐藏逻辑在 [shouldHideStateNotification]。
      *
      *  - [Notifier.CH_STATE]       会响铃（断开时提醒）
      *  - [Notifier.CH_STATE_LOW]   无声、不亮屏，状态栏留图标
@@ -489,13 +487,31 @@ class MqttService : Service(), MqttCallbackExtended {
         // 连接中 / 已连接 / 未配置 全部静默，避免开机后先响一声
         "限断", "仅断开时提醒" ->
             if (state == "Disconnected") Notifier.CH_STATE else Notifier.CH_STATE_QUIET
-        // 不显示状态通知：前台服务无法真正隐藏，退化为静默常驻
         "关闭" -> Notifier.CH_STATE_QUIET
         // 静音：不出声，但保留状态栏图标
         "静音" -> Notifier.CH_STATE_LOW
         // 限静：仅静音时段内不打扰
         "限静" -> if (inQuietHours()) Notifier.CH_STATE_LOW else Notifier.CH_STATE
         else -> Notifier.CH_STATE
+    }
+
+    /**
+     * 是否要**完全不占通知栏**（还原原版 `com.android.pushme` 的行为）。
+     *
+     * 原版是没有前台服务的普通 Service，所以「限断」下连接正常时它什么都不发：
+     *   if (mode == "限断" && state == "Connected") { cancel(1); return; }
+     * 本版为了后台存活加了前台服务，于是系统强制挂一条通知。要还原原版效果，
+     * 只能在该隐藏的时候主动 `stopForeground(STOP_FOREGROUND_REMOVE)` 把前台身份摘掉。
+     *
+     * 代价（必须让用户知道）：摘掉前台身份后，进程退回普通后台服务优先级，
+     * 系统在内存紧张或省电策略下可能回收 —— 原版一直是这个代价。
+     */
+    private fun shouldHideStateNotification(): Boolean = when (prefs.channel) {
+        // 连接正常 → 通知栏一条都不留；连接中/断开 → 照常显示（断开要提醒）
+        "限断", "仅断开时提醒" -> state == "Connected"
+        // 关闭 → 永远不显示，断开也不提醒
+        "关闭" -> true
+        else -> false
     }
 
     /** 是否处于静音时段（start~end，跨零点也成立） */
@@ -517,7 +533,7 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     /**
-     * 按当前设置重发状态通知。
+     * 按当前设置重发状态通知，或者按需把它彻底撤掉。
      *
      * 走 startForeground 而不是 notify：只有 startForeground 才能保证前台服务
      * 自己挂的那条通知换了 channel（Android 12+ 上对已发布的前台通知，
@@ -525,6 +541,23 @@ class MqttService : Service(), MqttCallbackExtended {
      */
     private fun applyStateNotification() {
         if (stopping || !alive) return
+
+        // 该隐藏时：摘掉前台身份 + 取消通知，服务本身继续跑（原版就是这么做的）
+        if (shouldHideStateNotification()) {
+            if (foreground) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                foreground = false
+            }
+            try {
+                androidx.core.app.NotificationManagerCompat.from(this)
+                    .cancel(Notifier.STATE_NOTIFICATION_ID)
+            } catch (_: Exception) {
+            }
+            lastPostedState = state
+            Log.i(TAG, "hide state notification (state=$state mode=${prefs.channel})")
+            return
+        }
+
         val ch = stateChannel()
         // 状态发生跃变才允许响铃；同一状态反复重连失败只更新文案，避免连环响
         val changed = state != lastPostedState
@@ -532,13 +565,16 @@ class MqttService : Service(), MqttCallbackExtended {
         val alert = changed && ch == Notifier.CH_STATE
         Log.i(TAG, "post state=$state ch=$ch fg=$foreground alert=$alert")
         val n = notifier.buildStateNotification(state, lastDetail, ch, alertOnlyOnce = !alert)
-        if (foreground) {
-            try {
-                startForeground(Notifier.STATE_NOTIFICATION_ID, n)
-                return
-            } catch (_: Exception) {
-                // 前台状态被系统回收过，退化为普通 notify
-            }
+
+        // 每次都先尝试挂回前台：之前可能因为「隐藏」被 stopForeground 摘掉过。
+        // Android 12+ 从后台重新进前台可能被拒（ForegroundServiceStartNotAllowedException），
+        // 那种情况退化为普通 notify —— 通知照发，只是少了前台保护。
+        try {
+            startForeground(Notifier.STATE_NOTIFICATION_ID, n)
+            foreground = true
+            return
+        } catch (e: Exception) {
+            Log.w(TAG, "startForeground failed: ${e.javaClass.simpleName}, fallback to notify")
         }
         try {
             androidx.core.app.NotificationManagerCompat.from(this)
