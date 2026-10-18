@@ -16,6 +16,8 @@ android/captures/
 android/key.properties
 *.jks
 *.keystore
+# 例外：CI 与本机共用的签名密钥，必须入库才能保证签名一致
+!android/app/debug.keystore
 
 # ===== 私有数据（不随代码分发）=====
 assets/seed/*.db

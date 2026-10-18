@@ -24,10 +24,20 @@ android {
         versionName = "5.1.0"
     }
 
+    signingConfigs {
+        // 固定使用随仓库提供的 keystore 签名，
+        // 保证「云端 CI 构建」与「本地构建」签名一致，可直接覆盖安装、不丢数据。
+        create("shared") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
-            // 使用 debug 签名即可在本机安装（如需发布请替换为自有签名）
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("shared")
             isMinifyEnabled = false
             isShrinkResources = false
         }
