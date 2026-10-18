@@ -6,6 +6,7 @@
 交互与视觉全面对齐 Material 3，功能一项不少：MQTT over TCP 直连、消息本地落库、三类内容渲染、统计看板、深浅色主题。
 
 > 本项目是**客户端**，不含服务端。推送服务需要你自己部署并配合其 HTTP 推送接口使用。
+> 服务端与 Windows 桌面端见下方 [相关项目](#相关项目与致谢)。
 
 ---
 
@@ -65,13 +66,12 @@ Android 不允许降级安装。**已在用 arm64 包就不要换 universal**（
 ## 从源码构建
 
 ```bash
-cd app
 flutter pub get
 flutter build apk --release --split-per-abi \
   --target-platform android-arm,android-arm64,android-x64
 ```
 
-产物在 `app/build/app/outputs/flutter-apk/`。
+产物在 `build/app/outputs/flutter-apk/`。
 
 ### 云端构建
 
@@ -101,10 +101,37 @@ JDK 21 + Flutter stable，先按 ABI 分别打包，再打一个全 ABI 并存�
 
 ---
 
+## 相关项目与致谢
+
+本项目是 **PushMe 生态里的 Android 客户端**。同一生态下还有其他作者维护的项目：
+
+| 项目 | 说明 | 协议 |
+| --- | --- | --- |
+| **[yafoo/pushme-client](https://github.com/yafoo/pushme-client)** | **Windows 桌面客户端**（Wails v3 + Go + Vue），在电脑上实时接收手机推送的消息，支持图表消息与插件扩展 | MIT |
+| [yafoo/pushme-server](https://github.com/yafoo/pushme-server) | 自建推送服务端（Node.js），接口参数与官方一致；Web 管理走 `3010`，MQTT/WebSocket 走 `3100` | MIT |
+| [PushMe 官网](https://push.i-i.me/) | 官方服务、App 下载与接口文档 | — |
+
+### 致谢
+
+- **重构基准**：原 Android 应用 `com.android.pushme`（闭源）。消息类型、字段命名、SQLite 表结构、
+  MQTT 主题与 clientId 规则，均按其实际行为对齐，以保证新版本能直接接住旧数据。
+- **[yafoo/pushme-client](https://github.com/yafoo/pushme-client)**：PushMe 生态的 Windows 桌面客户端（MIT）。
+  本项目的消息类型清单（text / markdown / html / data / chart 等）与它保持同一套生态约定，
+  手机上收到的消息可以在两个客户端上呈现一致的效果。
+- **[yafoo/pushme-server](https://github.com/yafoo/pushme-server)**：自建服务端（MIT）。
+  它的端口约定 —— `3010` HTTP API、`3100` MQTT —— 与本项目客户端侧默认配置一致，可直接对接。
+
+> 本项目代码为独立实现，未复制上述项目的源码；上述项目版权归各自作者所有。
+> 如有引用遗漏或描述不当，欢迎提 Issue 指出。
+
+---
+
 ## 目录结构
 
+仓库根目录即 Flutter 工程根：
+
 ```
-app/
+.
 ├── lib/
 │   ├── main.dart                  入口
 │   ├── core/                      状态管理、模型、主题、原生桥、格式化
@@ -137,7 +164,16 @@ app/
 
 ---
 
-## 参考
+## 推送接口
 
-- 原版应用 `com.android.pushme`（Java + 原生 View）
-- 服务端推送接口：`POST /`，表单字段 `push_key`、`title`、`content`、`type`
+客户端从服务端接收消息，服务端向外提供 HTTP 推送接口：
+
+```bash
+curl -d "push_key=YOUR_KEY&title=标题&content=正文&type=text" http://你的服务器:3010
+```
+
+- 表单字段：`push_key`、`title`、`content`、`type`
+- `type` 支持 `text` / `markdown` / `html` / `data` / `chart` 等
+- 客户端通过 MQTT（默认 `3100`）接收，HTTP 接口只负责投递
+
+具体参数以你所用服务端的文档为准，兼容官方接口格式的实现都可以对接。
