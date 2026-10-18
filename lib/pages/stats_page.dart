@@ -468,7 +468,9 @@ class _TrendChart extends StatelessWidget {
         ),
       );
     }
-    final maxV = days.map((e) => e.count).fold<int>(1, (a, b) => math.max(a, b));
+    // 真实峰值（可能为 0）；maxV 仅作除数，最小为 1，避免 0/0 得到 NaN
+    final peak = days.map((e) => e.count).fold<int>(0, (a, b) => math.max(a, b));
+    final maxV = peak == 0 ? 1 : peak;
     const chartH = 88.0;
 
     return Column(
@@ -477,7 +479,7 @@ class _TrendChart extends StatelessWidget {
         Row(
           children: [
             Text(
-              '峰值 $maxV 条 / 天',
+              peak == 0 ? '近 14 天暂无接收' : '峰值 $peak 条 / 天',
               style: TextStyle(
                 fontSize: 11,
                 fontWeight: FontWeight.w600,
