@@ -11,12 +11,15 @@ pluginManagement {
     includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
 
     repositories {
-        maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
-        maven { url = uri("https://maven.aliyun.com/repository/google") }
-        maven { url = uri("https://maven.aliyun.com/repository/public") }
+        // 官方源优先：CI 跑在 GitHub 上，直连比国内镜像更稳。
+        // 阿里云镜像只作兜底 —— 它一旦返回 502，Gradle 会把该仓库整个 disable，
+        // 排在前面就会连累后面所有源（踩过：build #22 全挂在 502 上）。
         google()
         mavenCentral()
         gradlePluginPortal()
+        maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+        maven { url = uri("https://maven.aliyun.com/repository/google") }
+        maven { url = uri("https://maven.aliyun.com/repository/public") }
     }
 }
 

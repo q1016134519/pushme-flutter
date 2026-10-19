@@ -58,7 +58,7 @@ Android 不允许降级安装。**已在用 arm64 包就不要换 universal**（
 | 消息详情 | text / markdown / html 三种格式渲染，收藏、复制、删除 |
 | 数据概览 | 消息总数 / 今日收到 / 未读 / 收藏，14 天趋势柱状图，主题分布 |
 | 设置 | 自建服务器 / 官方服务双模式、Push Key、端口、TLS、通道、主题、导入导出 |
-| 后台服务 | MQTT over TCP 长连接 + 前台服务常驻（`specialUse` 类型），断线自动重连 |
+| 后台服务 | MQTT over TCP 长连接；「通知/限静/静音」用前台服务常驻（`specialUse`），「限断/关闭」用闹钟心跳的普通后台服务；断线自动重连 |
 | 主题 | 跟随系统 / 浅色 / 深色，Material 3 配色 |
 
 ### 状态通知的行为
@@ -70,48 +70,60 @@ Android 不允许降级安装。**已在用 arm64 包就不要换 universal**（
 | 通知 | 显示，响铃 | 显示，响铃 |
 | 限静 | 显示，静音时段内静默 | 显示，静音时段内静默 |
 | 静音 | 显示，不出声、不亮屏 | 显示，不出声、不亮屏 |
-| **限断** | **静默常驻**（无声、不亮屏） | 显示，响铃 |
-| **关闭** | **静默常驻**（无声、不亮屏） | 静默常驻（不提醒） |
+| **限断** | **不显示（0 条）** | 显示，响铃 |
+| **关闭** | **不显示（0 条）** | 不显示，不提醒 |
 
-#### 为什么「限断」不再做到通知栏零条目
+#### 两种运行方式：前台服务 vs 普通后台服务
 
-v5.1.0 早期版本为了对齐原版观感，在「限断」档连接正常时用
-`stopForeground(STOP_FOREGROUND_REMOVE)` 把前台身份和通知一起撤掉。这个做法有致命缺陷：
+五个档位走的是两条完全不同的路径（判据见 `Prefs.needsForeground`）：
 
-1. 撤掉前台身份后，服务退回普通后台进程，进入 cached 状态；
-2. Android 12+ **禁止后台进程重新进入前台**——断线重连时 `startForeground()` 抛
-   `ForegroundServiceStartNotAllowedException`；
-3. 异常被吞掉，只能退化成普通 `notify`，从此永远回不到前台；
-4. 进程随后被冻结/限流，keepalive 停止，broker 判超时断开，重连又失败 —— 死循环。
+**「通知 / 限静 / 静音」—— 前台服务常驻。** 这三档本来就要显示状态，挂前台服务换更强的进程保护。
 
-**电池白名单救不了它**：`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 只豁免 Doze 与省电策略，
-不豁免「后台启动前台服务」的限制。这就是「加了白名单、锁了后台，切后台一会儿还是断」的根因。
+**「限断 / 关闭」—— 普通后台服务，通知栏干净。** 这两档的原意就是「别占通知栏」，
+所以压根不用 `startForegroundService`，改走普通 `startService`，连上之后一条通知都不留；
+「限断」只在真的断开时发一条普通通知（会响），「关闭」连这条都不发。
 
-原版之所以不掉线，是因为它从头到尾**没有进过前台**——一个裸后台 Service，
-只靠 `NetworkCallback` 里的一次 `WakeLock` 兜住重连，全程停在同一个后台服务状态，
-不会「掉出前台」。而本版需要前台服务来对抗 cached 冻结，就不能半途摘掉它。
+> 注意：不能「先进前台、再摘掉」。Android 12+ 禁止后台进程重新进入前台，
+> 一旦 `stopForeground` 掉出前台，之后 `startForeground()` 会抛
+> `ForegroundServiceStartNotAllowedException`，永远回不去。所以这两档是**从一开始就不进前台**。
 
-现在的做法：**前台服务自始至终挂着**，只切换通知走的通道来降低打扰。
+#### 锁屏不掉线的关键：心跳用闹钟，不用定时器
 
-#### 想真正一条通知都不留
+早期版本（以及 Paho 的默认行为）用 `TimerPingSender`，它本质上是一个 `java.util.Timer` 线程。
+**锁屏后设备进入 suspend，所有用户态线程一起停摆**，定时器自然到点不执行 —— 一个 `PINGREQ`
+都发不出去。broker（Aedes）按 `keepalive × 1.5` 判超时，到点没收到报文就 `close('keepalive timeout')`。
+表现就是「锁屏一会儿断开，解锁后重连」。
 
-Android 不允许前台服务隐藏自己的通知，但**用户**可以关掉该通道：
+现在改成 `AlarmMqttPingSender`（`android/app/src/main/kotlin/.../AlarmMqttPingSender.kt`）：
 
-设置 →「隐藏状态栏图标」→ 把「状态通知（静默）」设为「禁止」。
+- `AlarmManager.setExactAndAllowWhileIdle(RTC_WAKEUP, ...)` 排下一次心跳 —— 闹钟能把 CPU 从 suspend 里叫醒；
+- 广播 `onReceive` 里短暂持有 `PARTIAL_WAKE_LOCK`（20s 上限，3s 后主动放），把发包那几百毫秒兜住；
+- `onReceive` 跑在主线程，**不能等 ping 的结果**（最长 10s 会 ANR），只调 `checkForActivity()` 就返回。
 
-此时通知栏彻底干净，而前台服务仍在运行（进程保护一点不减），连接照旧保持。
-三档状态通道分别对应：`StateAlertChannel`（会响）/ `StateLowChannel`（无声）/
-`StateQuietChannel`（静默，限断与关闭档使用）。
+这套机制和原版 `com.android.pushme` 完全同构（反编译可见它的 `AlarmPingSender` 用的就是
+`setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, ...)`（反编译里是 type 0），日志 tag 为 `PUSHME[AlarmPingSender]`）。
+
+`MqttClient` 的构造器不接受自定义 `MqttPingSender`，所以改用 `MqttAsyncClient`。
+
+#### 想只在前三档隐藏状态栏图标
+
+「限断 / 关闭」本来就没有通知，不用管。前三档是前台服务，Android 不允许它隐藏自己的通知，
+但**用户**可以关掉对应通道：设置 →「隐藏状态栏图标」→ 把该通道设为「禁止」。
+此时通知栏干净，前台服务仍在运行。
 
 > 平台规则补充：通知显示时，若来自前台服务且通道重要性 ≤ `IMPORTANCE_MIN`，
 > `NotificationManagerService.enqueueNotificationInternal()` 会把重要性抬到 `IMPORTANCE_LOW`
-> （「重要性地板」）。所以静默通道仍会在通知栏留一条，只是不响不亮屏。
+> （「重要性地板」）。所以只要还在前台服务里，无论如何都留一条——这也是「限断」不走前台服务的原因之一。
 
 #### 其他保活措施
 
 - 服务类型用 `specialUse`（`PROPERTY_SPECIAL_USE_FGS_SUBTYPE=persistent_mqtt_push_connection`）。
   不能用 `dataSync`：Android 15 起 `dataSync` 前台服务累计跑满 6 小时会被系统强制停止。
-- `keepAliveInterval = 120s`：300s 恰好撞上运营商 NAT 空闲回收时间，会造成最长 7 分半的「假死」。
+- `keepAliveInterval = 300s`，由闹钟驱动。别为了「更快发现断线」把它压到 60~120s：
+  每次心跳都要把 CPU 从 suspend 里叫醒一次，一晚上几百次唤醒纯属浪费电；
+  300s 对应 broker 的超时窗口 450s，足够覆盖闹钟抖动。
+- `AlarmManager` 用 `RTC_WAKEUP` 精确闹钟，manifest 声明 `USE_EXACT_ALARM`（普通权限、装完即生效）。
+  若系统仍拒绝精确闹钟，代码会退化成 `setAndAllowWhileIdle`（Doze 下约 9 分钟一次），比「不发」好得多。
 - `START_STICKY` + `stopWithTask="false"`：划掉最近任务不清服务。
 - `BootReceiver` 开机自启。建议同时把本应用设为「不受限制」，并在 One UI 的
   「电池 → 后台使用限制」里加入「从不休眠的应用」（Samsung 特有）。
