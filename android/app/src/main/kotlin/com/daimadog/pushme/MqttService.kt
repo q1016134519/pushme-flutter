@@ -191,6 +191,22 @@ class MqttService : Service(), MqttCallbackExtended {
     /** 上一次真正发布出去的状态，用于判断「状态是否发生跃变」以决定要不要响铃 */
     private var lastPostedState: String = ""
 
+    /** 本次断线开始的时刻，用于「断线宽限期」判断 */
+    @Volatile
+    private var disconnectedAt: Long = 0L
+
+    /** 已经为哪一次断线提醒过（存的是当次的 disconnectedAt），避免反复响 */
+    private var alertedFor: Long = Long.MIN_VALUE
+
+    /**
+     * 断线宽限：刚断开的头 [ALERT_GRACE_MS] 不提醒。
+     *
+     * 三星 Freecess 会把后台进程冻结（解冻后约 6 秒又冻回去），冻结期间收不到 PINGRESP，
+     * 于是连接会周期性地「假死 → 被判定超时 → 重连」，一次只要几百毫秒。
+     * 不加宽限期的话，「限断」档会每隔几分钟弹一次断线提醒，比不提醒还烦。
+     */
+    private val alertGraceMs = 45_000L
+
     override fun onCreate() {
         super.onCreate()
         AppContextHolder.context = applicationContext
@@ -342,6 +358,7 @@ class MqttService : Service(), MqttCallbackExtended {
             retry = 0
             // 连着：让 Paho 按 keepAlive 决定这一发要不要真的发 PINGREQ。
             // 它同时会把下一次排程时间重新写到闹钟上（见 AlarmMqttPingSender.schedule）。
+            Log.i(TAG, "tick: connected, keepalive check")
             try {
                 PingLink.comms?.checkForActivity()
             } catch (e: Exception) {
@@ -699,16 +716,20 @@ class MqttService : Service(), MqttCallbackExtended {
                 Log.i(TAG, "quiet: no notification (state=$state mode=${prefs.channel})")
                 return
             }
-            val alert = changed && ch == Notifier.CH_STATE
-            if (!changed) {
-                // 已经是「断开」且通知发过了：反复重连失败不要反复重贴通知，
-                // 否则用户手动划掉之后每次重试都会再冒出来。
+            // 宽限期内不打扰：冻结→闹钟解冻→重连通常 10 秒内就恢复，
+            // 这种抖动不该弹「已断开」。
+            val settling = System.currentTimeMillis() - disconnectedAt < alertGraceMs
+            if (settling) {
+                Log.i(TAG, "quiet: disconnect within grace, hold alert")
                 return
             }
+            // 同一次断线只提醒一次：用户手动划掉之后，不要每次重试都重新贴出来
+            if (alertedFor == disconnectedAt) return
+            alertedFor = disconnectedAt
             val n = notifier.buildStateNotification(
-                state, lastDetail, Notifier.CH_STATE, alertOnlyOnce = !alert
+                state, lastDetail, Notifier.CH_STATE, alertOnlyOnce = true
             )
-            Log.i(TAG, "quiet: alert notification (state=$state alert=$alert)")
+            Log.i(TAG, "quiet: alert notification (state=$state)")
             try {
                 androidx.core.app.NotificationManagerCompat.from(this)
                     .notify(Notifier.STATE_NOTIFICATION_ID, n)
@@ -742,6 +763,10 @@ class MqttService : Service(), MqttCallbackExtended {
 
     private fun setState(state: String, detail: String) {
         if (!alive) return
+        // 只在「连上 → 断开」的跃变点记录时间；反复重试失败不刷新，否则宽限期永远走不完
+        if (state == "Disconnected" && MqttService.state != "Disconnected") {
+            disconnectedAt = System.currentTimeMillis()
+        }
         MqttService.state = state
         MqttService.lastDetail = detail
         notifier.ensureChannels(prefs)
