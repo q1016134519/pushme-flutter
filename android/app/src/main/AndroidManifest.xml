@@ -77,6 +77,18 @@
             </intent-filter>
         </receiver>
 
+        <!--
+          唤醒闹钟的接收器。**必须在清单里注册**，不能像上一版那样动态注册：
+          闹钟由系统持有，进程被系统 / 三星清理掉之后闹钟照样会响；而动态注册的
+          接收器会随进程一起消失，广播无人接收，进程也就再也起不来了。
+          清单注册之后，这一次广播能把进程（连同 MqttService）重新拉起来
+          —— 这是推送服务能自愈的根本原因。
+          exported=false 是安全的：PendingIntent 由本应用创建，系统按本应用身份投递。
+        -->
+        <receiver
+            android:name=".PingReceiver"
+            android:exported="false" />
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

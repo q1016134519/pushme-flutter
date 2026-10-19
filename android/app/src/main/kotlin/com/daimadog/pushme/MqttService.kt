@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
 import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
 import org.eclipse.paho.client.mqttv3.MqttAsyncClient
@@ -70,6 +71,37 @@ class MqttService : Service(), MqttCallbackExtended {
         var running: Boolean = false
             private set
 
+        /** 当前实例。闹钟巡检要能直接找到它，而不是靠 startService 绕一圈 */
+        @Volatile
+        private var instance: MqttService? = null
+
+        /** 主线程派发用（广播接收器不能直接碰 Service 状态） */
+        private val MAIN = Handler(Looper.getMainLooper())
+
+        /** 现在是否真的连着。闹钟接收器靠它决定下次巡检间隔（连上 240s / 断了 30s） */
+        val isConnectedNow: Boolean
+            get() = instance?.client?.isConnected == true
+
+        /**
+         * 闹钟到点 / 屏幕亮起时的统一入口。
+         *
+         * 三层兜底：
+         *  - 服务活着 → 交给 [onTick] 自检（连着就发心跳，断了就重连）
+         *  - 服务已被系统杀掉 → 靠 [start] 把进程和服务重新拉起来
+         *  - 用户关掉了服务 → 什么都不做（闹钟已在 [PingReceiver] 里被取消）
+         */
+        fun onWake(ctx: Context) {
+            val inst = instance
+            if (inst == null || !inst.alive) {
+                if (Prefs(ctx).serviceEnabled) {
+                    Log.i(TAG, "wake: service not alive, restart it")
+                    start(ctx)
+                }
+                return
+            }
+            MAIN.post { inst.onTick() }
+        }
+
         fun start(ctx: Context) {
             // 「限断」「关闭」不需要常驻通知，就用普通 startService 起一个后台服务。
             // 这一步必须和 onCreate 里的判断一致：如果这里调了 startForegroundService
@@ -119,6 +151,9 @@ class MqttService : Service(), MqttCallbackExtended {
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var cfgReceiver: BroadcastReceiver? = null
 
+    /** 亮屏 / 解锁监听：锁屏期间的兜底恢复通道 */
+    private var screenReceiver: BroadcastReceiver? = null
+
     /**
      * 是否已挂上前台服务。
      *
@@ -164,17 +199,27 @@ class MqttService : Service(), MqttCallbackExtended {
         db = MessageDb.get(this)
         alive = true
         stopping = false
+        instance = this
         MqttService.state = "Connecting"
         running = true
         notifier.ensureChannels(prefs)
         // 只有需要常驻通知的档位才挂前台服务。「限断/关闭」走普通后台服务，
-        // 靠 AlarmMqttPingSender 的闹钟维持心跳（与原版同构）。
+        // 靠 [PushAlarm] 的精确闹钟维持心跳（与原版同构）。
         if (prefs.needsForeground) {
             enterForeground(
                 notifier.buildStateNotification("Connecting", "正在连接…", stateChannel())
             )
         }
+        // 先把唤醒闹钟排上：即使这次连接失败、Paho 还没机会调 start()，
+        // 也一定有一次唤醒在等着我们（否则「首次就失败」会变成永久离线）。
+        PushAlarm.schedule(this, PushAlarm.INTERVAL_RETRY)
+        Log.i(
+            TAG,
+            "service created (mode=${prefs.channel} fg=${prefs.needsForeground} " +
+                "exactAlarm=${PushAlarm.canExact(this)})"
+        )
         registerNetworkCallback()
+        registerScreenReceiver()
         broadcastStatus("Connecting")
         connect()
     }
@@ -203,6 +248,8 @@ class MqttService : Service(), MqttCallbackExtended {
         when (action) {
             ACTION_STOP -> {
                 prefs.serviceEnabled = false
+                // 用户主动停止：连唤醒闹钟一起收掉，否则闹钟还会把服务再拉起来
+                PushAlarm.cancel(this)
                 // 先正常收尾：此时 stopping 仍为 false，通知能更新成「Closed」，
                 // 紧接着就被 stopForeground 移除，用户看到的是完整的一次退出而不是半截状态。
                 disconnect()
@@ -216,6 +263,8 @@ class MqttService : Service(), MqttCallbackExtended {
             ACTION_RECONNECT -> {
                 prefs.serviceEnabled = true
                 retry = 0
+                // 重新启用时闹钟可能已经被 ACTION_STOP 收掉了，补排一次
+                PushAlarm.schedule(this, PushAlarm.INTERVAL_RETRY)
                 connect()
             }
             ACTION_REFRESH -> {
@@ -233,6 +282,7 @@ class MqttService : Service(), MqttCallbackExtended {
         alive = false
         stopping = true
         running = false
+        if (instance === this) instance = null
         attempt++          // 让所有在途连接线程的结果作废
         connecting = false
         handler.removeCallbacksAndMessages(null)
@@ -240,7 +290,10 @@ class MqttService : Service(), MqttCallbackExtended {
         foreground = false
         MqttService.state = "Closed"
         unregisterNetworkCallback()
+        unregisterScreenReceiver()
         broadcastStatus("Closed")
+        // 注意：这里**不取消**唤醒闹钟。服务可能是被系统回收的，
+        // 保留闹钟才能让 PingReceiver 把进程拉起来（START_STICKY + 闹钟双保险）。
         super.onDestroy()
     }
 
@@ -267,6 +320,57 @@ class MqttService : Service(), MqttCallbackExtended {
         // 每跳一次状态就算一次跃变，会把「断开提醒」变成连环响铃。
         if (MqttService.state != "Disconnected") setState("Connecting", "正在连接…")
         Thread { doConnect(t, my) }.start()
+    }
+
+    /**
+     * 巡检一次：这是整个保活体系的「自愈点」。
+     *
+     * 触发源有三个，都会走到这里：
+     *  1. 唤醒闹钟（[PingReceiver]）—— 锁屏 / 进程被杀后的主要通道
+     *  2. 屏幕亮起 / 解锁 —— 用户掏出手机的瞬间立刻恢复
+     *  3. 网络恢复（[registerNetworkCallback]）
+     *
+     * 逻辑很简单，但必须**每次都有结论**：要么把心跳发出去，要么发起重连。
+     * 上一版的问题是「心跳排程挂在 Paho 内部、重试挂在 Handler 上」，
+     * 任何一条链断掉都没有人补，于是进程活着却永久离线。
+     */
+    private fun onTick() {
+        if (!alive || stopping) return
+
+        val c = client
+        if (c != null && c.isConnected) {
+            retry = 0
+            // 连着：让 Paho 按 keepAlive 决定这一发要不要真的发 PINGREQ。
+            // 它同时会把下一次排程时间重新写到闹钟上（见 AlarmMqttPingSender.schedule）。
+            try {
+                PingLink.comms?.checkForActivity()
+            } catch (e: Exception) {
+                // Paho 判定 ping 超时时会在这里抛异常，并同步回调 connectionLost()，
+                // 那边已经排了重连。这里只补一次「10 秒后再来看一眼」，
+                // 避免万一没回调 connectionLost 就没人管了。
+                Log.w(TAG, "tick: ping failed (${e.javaClass.simpleName})")
+                PingLink.comms = null
+                PushAlarm.schedule(this, 10_000L)
+            }
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (connecting && now - connectingSince < connectTimeoutMs) {
+            Log.i(TAG, "tick: still connecting, skip")
+            return
+        }
+        if (connecting) {
+            // 上一次尝试卡死了（broker 接了 TCP 却永不回 CONNACK 之类）：
+            // 作废在途线程，重新来过。不加这一步，"connecting" 会永久为 true，
+            // 之后每次 connect() 都在第一行被挡回去 —— 进程活着却永远不重连。
+            Log.w(TAG, "tick: connect stuck ${now - connectingSince}ms, reset")
+            attempt++
+            connecting = false
+            PingLink.comms = null
+        }
+        Log.i(TAG, "tick: disconnected, reconnect now")
+        connect()
     }
 
     private fun doConnect(t: Prefs.Target, my: Int) {
@@ -395,13 +499,16 @@ class MqttService : Service(), MqttCallbackExtended {
     private fun scheduleRetry() {
         retry++
         val delay = when {
-            retry <= 1 -> 5_000L
-            retry <= 3 -> 15_000L
-            retry <= 6 -> 30_000L
-            else -> 60_000L
+            retry <= 1 -> 10_000L
+            retry <= 3 -> 30_000L
+            retry <= 6 -> 60_000L
+            else -> 120_000L
         }
-        handler.removeCallbacksAndMessages(null)
-        handler.postDelayed({ connect() }, delay)
+        // 用闹钟而不是 `handler.postDelayed`：
+        //  - 熄屏 suspend 期间 uptime 不走，postDelayed 会一直不触发；
+        //  - 任何一次 `removeCallbacks` 都可能把重试悄悄删掉，且没有任何补偿机制
+        //    —— 上一版就是这样永久停摆的（真机实测 57 分钟 CPU 只用了 7.68 秒）。
+        PushAlarm.schedule(this, delay)
     }
 
     private fun disconnectQuiet() {
@@ -684,5 +791,46 @@ class MqttService : Service(), MqttCallbackExtended {
         } catch (_: Exception) {
         }
         netCallback = null
+    }
+
+    // ---------------- 亮屏 / 解锁 ----------------
+
+    /**
+     * 亮屏和解锁时立刻体检一次。
+     *
+     * 这是「解锁后不恢复」最直接的对症下药：不管锁屏期间发生了什么（进程被冻结、
+     * 心跳链断了、网络切走了），用户解锁的这一刻都会强制走一次 [onTick]。
+     *
+     * ⚠️ `ACTION_SCREEN_ON` / `ACTION_USER_PRESENT` 属于隐式广播，Android 8+ 起
+     * 不允许清单注册（静态注册收不到），只能在运行时注册。
+     */
+    private fun registerScreenReceiver() {
+        try {
+            val r = object : BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: Intent?) {
+                    MAIN.post { onTick() }
+                }
+            }
+            ContextCompat.registerReceiver(
+                this,
+                r,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_USER_PRESENT)
+                },
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            screenReceiver = r
+        } catch (e: Exception) {
+            Log.w(TAG, "register screen receiver failed: ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun unregisterScreenReceiver() {
+        try {
+            screenReceiver?.let { unregisterReceiver(it) }
+        } catch (_: Exception) {
+        }
+        screenReceiver = null
     }
 }

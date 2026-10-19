@@ -1,155 +1,70 @@
 package com.daimadog.pushme
 
-import android.app.AlarmManager
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.os.Build
-import android.os.PowerManager
 import android.util.Log
-import androidx.core.content.ContextCompat
 import org.eclipse.paho.client.mqttv3.MqttPingSender
 import org.eclipse.paho.client.mqttv3.internal.ClientComms
 
 /**
- * 闹钟式心跳：用 AlarmManager 唤醒 CPU 去发 PINGREQ，而不是靠后台线程的定时器。
+ * Paho 的心跳排程接口适配器 —— 只做「把 Paho 的排程意图翻译成闹钟」，不再自己管广播接收器。
  *
- * ## 为什么必须这么做
+ * Paho 会在三个时机调用它：
+ *  - 连接成功后 `start()`
+ *  - 每次 `checkForActivity()` 算好「下次该什么时候发」时 `schedule(delay)`
+ *  - 连接关闭 / 断线时 `stop()`
  *
- * Paho 的 `MqttClient` 默认用 [org.eclipse.paho.client.mqttv3.TimerPingSender]，
- * 它本质上是一个 `java.util.Timer` 线程。锁屏后设备进入 suspend，**所有用户态线程一起停摆**，
- * 定时器自然不会到点执行 —— 于是我们一个 PINGREQ 都发不出去。
+ * **`stop()` 里绝对不能取消闹钟。** Paho 在 ping 超时、broker 主动断开、手动 disconnect
+ * 时都会调 `stop()`；上一版就在这里 `alarmManager.cancel()`，于是唯一的唤醒源被自己关掉，
+ * 进程还活着却再也不会醒 —— 真机实测 45 分钟零唤醒、CPU 时间几乎为零，
+ * 表现就是「解锁后也不恢复」。
  *
- * broker（Aedes）按 `keepalive × 1.5` 判定超时：到点没收到任何报文就 `close('keepalive timeout')`。
- * 表现就是「锁屏一会儿就断开，解锁后重连」。
- *
- * 原版 `com.android.pushme` 不受影响，正是因为它在反编译代码里用的是
- * `[AlarmPingSender].Schedule next alarm at ...` + `AlarmManager.setExactAndAllowWhileIdle(RTC_WAKEUP, ...)`，
- * 闹钟能把 CPU 从 suspend 里叫醒，`onReceive` 里再短暂持有 PARTIAL_WAKE_LOCK 把 ping 发出去。
- *
- * 本类就是那套机制的重写版：不常驻 wakelock（那样整晚不睡、耗电），
- * 每次只醒几百毫秒。
+ * 现在闹钟归 [PushAlarm] 管，生命周期只跟「服务是否启用」绑定。
  */
 class AlarmMqttPingSender(
     private val ctx: Context,
     private val clientId: String
 ) : MqttPingSender {
 
-    private var comms: ClientComms? = null
-    private var alarmManager: AlarmManager? = null
-    private var pendingIntent: PendingIntent? = null
-    private var receiver: BroadcastReceiver? = null
-    private var started = false
+    /** 本客户端自己的通道，用于在 stop() 时判断「全局引用还是不是我的」 */
+    private var myComms: ClientComms? = null
 
-    /** 由 Paho 在构造客户端时回调，拿到内部通信对象 */
     override fun init(comms: ClientComms) {
-        this.comms = comms
+        myComms = comms
+        PingLink.comms = comms
     }
 
     override fun start() {
-        if (started) stop()
-        val am = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
-        alarmManager = am
-
-        val action = "com.daimadog.pushme.PING.$clientId"
-        val r = object : BroadcastReceiver() {
-            override fun onReceive(c: Context?, intent: Intent?) {
-                // onReceive 跑在主线程，这里**绝不能等** ping 的结果（最多 10s 会 ANR）。
-                // 只负责把 CPU 叫醒：setExactAndAllowWhileIdle 只保证「到点唤醒」，
-                // 唤醒后系统还会很快重新挂起，所以短暂持锁把发包的几百毫秒兜住，
-                // 3 秒后（那时 CPU 一定还醒着）再释放。
-                val pm = c?.getSystemService(Context.POWER_SERVICE) as? PowerManager
-                val wl = try {
-                    pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PushMe:MqttPing")
-                } catch (_: Exception) {
-                    null
-                }
-                try {
-                    wl?.acquire(20_000L)
-                } catch (_: Exception) {
-                }
-                try {
-                    comms?.checkForActivity()
-                } catch (e: Exception) {
-                    Log.w(TAG, "ping failed: ${e.javaClass.simpleName}")
-                }
-                RELEASE_HANDLER.postDelayed({
-                    try {
-                        if (wl?.isHeld == true) wl.release()
-                    } catch (_: Exception) {
-                    }
-                }, 3_000L)
-            }
-        }
-        receiver = r
-        try {
-            // API 33+ 注册非导出广播必须显式给 flag，否则抛 SecurityException
-            ContextCompat.registerReceiver(
-                ctx, r, IntentFilter(action), ContextCompat.RECEIVER_NOT_EXPORTED
-            )
-        } catch (e: Exception) {
-            Log.w(TAG, "register ping receiver failed: ${e.message}")
-            return
-        }
-
-        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
-            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0)
-        pendingIntent = PendingIntent.getBroadcast(
-            ctx, clientId.hashCode(), Intent(action).setPackage(ctx.packageName), flags
-        )
-        started = true
-        // 首次排程交给 Paho：它连上后会立刻调 schedule(keepAlive)
-        schedule(KEEPALIVE_HINT_MS)
         Log.i(TAG, "ping alarm started ($clientId)")
+        PushAlarm.schedule(ctx, PushAlarm.INTERVAL_CONNECTED)
+    }
+
+    /**
+     * 压上限：Paho 有时会算出很长的间隔（例如「还有很久才到 keepAlive」），
+     * 我们不希望唤醒间隔超过 [PushAlarm.INTERVAL_CONNECTED]，否则断线恢复太慢。
+     */
+    override fun schedule(delayInMilliseconds: Long) {
+        val d = delayInMilliseconds.coerceIn(1_000L, PushAlarm.INTERVAL_CONNECTED)
+        PushAlarm.schedule(ctx, d)
     }
 
     override fun stop() {
-        if (!started) return
-        started = false
-        try {
-            pendingIntent?.let { alarmManager?.cancel(it) }
-        } catch (_: Exception) {
-        }
-        try {
-            receiver?.let { ctx.unregisterReceiver(it) }
-        } catch (_: Exception) {
-        }
-        Log.i(TAG, "ping alarm stopped ($clientId)")
-    }
-
-    override fun schedule(delayInMilliseconds: Long) {
-        val am = alarmManager ?: return
-        val pi = pendingIntent ?: return
-        val at = System.currentTimeMillis() + delayInMilliseconds.coerceAtLeast(1_000L)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                // 精确闹钟能穿透 Doze，是锁屏保活的关键
-                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
-            } else {
-                am.setExact(AlarmManager.RTC_WAKEUP, at, pi)
-            }
-        } catch (e: SecurityException) {
-            // Android 14 起 SCHEDULE_EXACT_ALARM 默认不授予，精确闹钟会抛 SecurityException。
-            // 退化成非精确闹钟：Doze 里约 9 分钟一次，仍比「完全不发」好得多。
-            Log.w(TAG, "exact alarm denied, fallback to inexact")
-            try {
-                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
-            } catch (_: Exception) {
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "schedule alarm failed: ${e.message}")
-        }
+        // 只解除关联，不取消闹钟（见类注释）。加身份判断：新客户端的 init() 可能已经先跑了。
+        if (PingLink.comms === myComms) PingLink.comms = null
+        Log.i(TAG, "ping alarm detached ($clientId)")
     }
 
     companion object {
         private const val TAG = "PushMeService"
-
-        /** 首次排程用；Paho 连上后会用自己的 keepAlive 重新 schedule */
-        private const val KEEPALIVE_HINT_MS = 300_000L
-
-        /** 放锁用，不依赖任何 Service 生命周期 */
-        private val RELEASE_HANDLER = android.os.Handler(android.os.Looper.getMainLooper())
     }
+}
+
+/**
+ * 当前活着的 MQTT 客户端的内部通道。
+ *
+ * [PingReceiver] 在闹钟到点时需要通过它调用 `checkForActivity()` 把 PINGREQ 发出去
+ * —— `ClientComms` 是 Paho 的 internal 包，只能靠 `MqttPingSender.init()` 拿到。
+ */
+object PingLink {
+    @Volatile
+    var comms: ClientComms? = null
 }
