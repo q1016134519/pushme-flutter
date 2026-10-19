@@ -95,15 +95,13 @@ class _SettingsPageState extends State<SettingsPage> {
       '通知': '常驻状态通知，断开时响铃提醒',
       '限静': '静音时段内不响铃，状态栏仍显示',
       '静音': '状态通知不出声，状态栏仍显示',
-      '限断': '平时静默常驻，断开才响铃',
-      '关闭': '静默常驻，断开也不提醒',
+      '限断': '连接正常时通知栏不显示，断开才响铃提醒',
+      '关闭': '不显示任何状态通知，断开也不提醒',
     };
-    const warn = 'Android 12 起，前台服务必须挂一条常驻通知，系统才允许它长期存活；'
-        '把它撤掉，应用切到后台几分钟后就会被冻结、连接随之断开——'
-        '这正是「加了电池白名单还是掉线」的原因。'
-        '「限断 / 关闭」已把这条通知压到最静默（无声、不亮屏），但系统仍会保留一条。'
-        '想彻底不显示：在下一行「隐藏状态栏图标」里把「状态通知（静默）」关掉，'
-        '服务照旧运行，通知不再出现。';
+    const warn = '「限断 / 关闭」不占用前台服务，所以通知栏能保持干净；'
+        '连接靠 AlarmManager 闹钟心跳维持（和原版同一套机制），锁屏期间照常发心跳。'
+        '代价是进程保护弱一些：建议把本应用设为「不受限制」，'
+        '并在三星「电池 → 后台使用限制」里加入「从不休眠的应用」。';
     final current = _s.str('channel', '限断');
     final picked = await showModalBottomSheet<String>(
       context: context,
@@ -441,7 +439,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       SettingTile(
                         icon: Icons.visibility_off_rounded,
                         title: '隐藏状态栏图标',
-                        subtitle: '关掉「状态通知」通道即可彻底不显示，服务不受影响',
+                        subtitle: '仅「通知 / 静音 / 限静」三档需要；限断与关闭本身就不显示',
                         onTap: () => NativeApi.open('channel'),
                       ),
                       const Divider(height: 1),

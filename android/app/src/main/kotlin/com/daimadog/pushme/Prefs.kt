@@ -93,6 +93,19 @@ class Prefs(context: Context) {
         get() = sp.getString(CHANNEL, "限断") ?: "限断"
         set(v) = put(CHANNEL, v)
 
+    /**
+     * 这个档位是否需要**常驻通知**（也就是是否需要前台服务）。
+     *
+     * 「限断」「关闭」要的是通知栏干净：连上之后一条都不留，只有断开才提醒。
+     * 这两个档位一律不挂前台服务，退回原版那种普通后台服务 + 闹钟心跳。
+     * 其余三档本来就要显示状态，用前台服务换更强的进程保护。
+     */
+    val needsForeground: Boolean
+        get() = when (channel) {
+            "限断", "仅断开时提醒", "关闭" -> false
+            else -> true
+        }
+
     var channelStart: Int
         get() = safeInt(CHANNEL_START, 23)
         set(v) = put(CHANNEL_START, v)

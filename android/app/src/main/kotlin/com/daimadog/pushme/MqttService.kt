@@ -16,7 +16,7 @@ import android.os.PowerManager
 import android.util.Log
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
 import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
-import org.eclipse.paho.client.mqttv3.MqttClient
+import org.eclipse.paho.client.mqttv3.MqttAsyncClient
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions
 import org.eclipse.paho.client.mqttv3.MqttMessage
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
@@ -45,6 +45,9 @@ class MqttService : Service(), MqttCallbackExtended {
         const val ACTION_RECONNECT = "com.daimadog.pushme.RECONNECT"
         const val ACTION_REFRESH = "com.daimadog.pushme.REFRESH_NOTIFICATION"
 
+        /** 告诉 onCreate/onStartCommand：本次是用 startForegroundService 起的 */
+        const val EXTRA_AS_FOREGROUND = "as_foreground"
+
         @Volatile
         var state: String = "Closed"
             private set
@@ -68,8 +71,14 @@ class MqttService : Service(), MqttCallbackExtended {
             private set
 
         fun start(ctx: Context) {
-            val i = Intent(ctx, MqttService::class.java).setAction(ACTION_START)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
+            // 「限断」「关闭」不需要常驻通知，就用普通 startService 起一个后台服务。
+            // 这一步必须和 onCreate 里的判断一致：如果这里调了 startForegroundService
+            // 却没在 5 秒内 startForeground，系统会直接崩掉进程。
+            val fg = Prefs(ctx).needsForeground
+            val i = Intent(ctx, MqttService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_AS_FOREGROUND, fg)
+            if (fg && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
             else ctx.startService(i)
         }
 
@@ -100,7 +109,7 @@ class MqttService : Service(), MqttCallbackExtended {
     private lateinit var notifier: Notifier
     private var db: MessageDb? = null
 
-    private var client: MqttClient? = null
+    private var client: MqttAsyncClient? = null
     private var target: Prefs.Target? = null
 
     private val handler = Handler(Looper.getMainLooper())
@@ -158,9 +167,13 @@ class MqttService : Service(), MqttCallbackExtended {
         MqttService.state = "Connecting"
         running = true
         notifier.ensureChannels(prefs)
-        enterForeground(
-            notifier.buildStateNotification("Connecting", "正在连接…", stateChannel())
-        )
+        // 只有需要常驻通知的档位才挂前台服务。「限断/关闭」走普通后台服务，
+        // 靠 AlarmMqttPingSender 的闹钟维持心跳（与原版同构）。
+        if (prefs.needsForeground) {
+            enterForeground(
+                notifier.buildStateNotification("Connecting", "正在连接…", stateChannel())
+            )
+        }
         registerNetworkCallback()
         broadcastStatus("Connecting")
         connect()
@@ -176,10 +189,11 @@ class MqttService : Service(), MqttCallbackExtended {
         if (action != ACTION_STOP) {
             stopping = false
             alive = true
-            if (!foreground) {
-                // 实例被复用（stopSelf 之后很快又来一次 start，onCreate 不会再跑）：
-                // 必须重新挂回前台，否则 startForegroundService 会在 5 秒后
-                // 判定「没有调用 startForeground」而直接崩溃。
+            // 只在这一条 intent 明确要求「作为前台服务启动」（即调用方用了
+            // startForegroundService）时才挂前台，否则 Android 会因为「5 秒内没调
+            // startForeground」直接崩掉进程。用普通 startService 起的实例不能这么干。
+            val asForeground = intent?.getBooleanExtra(EXTRA_AS_FOREGROUND, false) ?: false
+            if (asForeground && !foreground) {
                 enterForeground(
                     notifier.buildStateNotification(state, lastDetail, stateChannel())
                 )
@@ -256,33 +270,37 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     private fun doConnect(t: Prefs.Target, my: Int) {
-        var pending: MqttClient? = null
+        var pending: MqttAsyncClient? = null
         try {
             disconnectQuiet()
             val uri = "${if (t.tls) "ssl" else "tcp"}://${formatHost(t.host)}:${t.port}"
-            val cli = MqttClient(uri, "me_${t.key}", MemoryPersistence())
+            // 关键：用 AlarmMqttPingSender 而不是 Paho 默认的 TimerPingSender。
+            // 后者是 java.util.Timer 线程，锁屏后整个进程一起 suspend，心跳永远发不出去，
+            // broker 按 keepalive×1.5 判定超时就把我们踢了——「锁屏断开、解锁重连」的真凶。
+            // 原版 com.android.pushme 用的就是 AlarmManager 唤醒方案，这里对齐它。
+            val cli = MqttAsyncClient(
+                uri, "me_${t.key}", MemoryPersistence(), AlarmMqttPingSender(this, "me_${t.key}")
+            )
             pending = cli
             cli.setCallback(this)
             val opt = MqttConnectOptions().apply {
                 isAutomaticReconnect = false
                 isCleanSession = true
                 connectionTimeout = 20
-                // 心跳间隔。原来取 300s，正好和运营商 NAT 的空闲回收时间撞在一起：
-                // NAT 先把映射表项丢掉，我们的 PINGREQ 发进黑洞，要到 1.5×300=450s
-                // 之后 Paho 才判定超时，中间最长 7 分半是「假死」。
-                // 改成 120s：每两分钟一次心跳能持续刷新 NAT 映射，最长失联窗口压到 3 分钟。
-                keepAliveInterval = 120
+                // 心跳 300s，由闹钟驱动。别为了「快」压到 60~120s：
+                // 每次心跳都要把 CPU 从 suspend 里叫醒一次，一晚上 700 多次唤醒纯属浪费电。
+                // 300s 下 broker 的超时窗口是 450s，足够覆盖唤醒抖动。
+                keepAliveInterval = 300
                 maxInflight = 100
                 if (t.tls) {
                     val sf = buildSocketFactory(t)
                     if (sf != null) socketFactory = sf
                 }
             }
-            // 必须用「带超时的等待」而不是同步 connect()：
-            // Paho 的阻塞式 connect() 内部是 Token.waitForCompletion()（无超时），
+            // 必须用「带超时的等待」而不是阻塞 connect()：
             // 一旦 broker 接受 TCP 却不回 CONNACK（端口填错、被墙、TLS 端口写成明文），
             // 这个线程会永久挂住，通知栏就永远停在「正在连接…」。
-            cli.connectWithResult(opt).waitForCompletion(connectTimeoutMs)
+            cli.connect(opt).waitForCompletion(connectTimeoutMs)
             if (my != attempt || !alive) {
                 try {
                     cli.close(true)
@@ -389,7 +407,15 @@ class MqttService : Service(), MqttCallbackExtended {
     private fun disconnectQuiet() {
         try {
             client?.let {
-                if (it.isConnected) it.disconnect(500)
+                // 异步客户端的 disconnect 只是把包排进发送队列就返回，
+                // 不等它发完就 close(force) 的话 broker 那边看到的是「连接被中断」。
+                // 这里最多等 500ms，让 DISCONNECT 报文真正出去。
+                if (it.isConnected) {
+                    try {
+                        it.disconnect().waitForCompletion(500L)
+                    } catch (_: Exception) {
+                    }
+                }
                 it.close(true)
             }
         } catch (_: Exception) {
@@ -525,28 +551,65 @@ class MqttService : Service(), MqttCallbackExtended {
     }
 
     /**
-     * 按当前设置重发状态通知。
+     * 按当前设置刷新状态通知。
      *
-     * ⚠️⚠️ 这里**绝对不能** `stopForeground` —— 这是上一版最大的坑。
+     * 两条完全不同的路径，取决于 [Prefs.needsForeground]：
      *
-     * 「限断」档曾经在连接正常时用 `stopForeground(STOP_FOREGROUND_REMOVE)` 把通知撤掉，
-     * 服务于是退回普通后台优先级。之后一旦断线要重连，Android 12+ **禁止后台进程再进入前台**，
-     * `startForeground` 抛 `ForegroundServiceStartNotAllowedException`，只能退化成普通 notify，
-     * 于是永远回不到前台 → 被系统冻结/限流 → keepalive 停止 → broker 断开 → 重连又失败，死循环。
-     * 这正是「给了电池白名单、锁了后台，切后台一会儿还是断」的原因：
-     * 电池白名单只豁免 Doze 与省电策略，**不豁免后台启动前台服务的限制**。
+     * **A. 通知 / 静音 / 限静 —— 前台服务常驻**
+     * 这些档位本来就要显示状态，挂前台服务换进程保护。这里**绝对不能** `stopForeground`：
+     * 一旦掉出前台，Android 12+ 不允许后台进程再进来，`startForeground` 抛
+     * `ForegroundServiceStartNotAllowedException`，之后永远回不到前台 →
+     * 被冻结 → 心跳停 → broker 踢人 → 重连失败，死循环。
      *
-     * 正确做法：前台服务自始至终挂着，靠「换成不响的通道」来降低打扰；
-     * 要让通知栏彻底一条都不留，由用户到系统设置里把该通知通道关掉——
-     * 那时前台服务仍在运行（进程仍受保护），只是通知不再显示。
+     * **B. 限断 / 关闭 —— 普通后台服务，通知栏干净**
+     * 连上之后一条通知都不留，只有断开才发一条普通通知提醒（这就是「限断」的原意）。
+     * 这里会 `stopForeground` 摘掉前台身份，但**摘掉后本档位永远不会再尝试挂回前台**，
+     * 所以不会踩上面那个坑。心跳由 [AlarmMqttPingSender] 的闹钟维持，
+     * 与原版 `com.android.pushme` 完全同构。
      */
     private fun applyStateNotification() {
         if (stopping || !alive) return
 
-        val ch = stateChannel()
         // 状态发生跃变才允许响铃；同一状态反复重连失败只更新文案，避免连环响
         val changed = state != lastPostedState
         lastPostedState = state
+        val ch = stateChannel()
+
+        if (!prefs.needsForeground) {
+            if (foreground) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                foreground = false
+                Log.i(TAG, "leave foreground (mode=${prefs.channel})")
+            }
+            // 「限断」只在断开时提醒；「关闭」永远不提醒
+            val wantShow = prefs.channel != "关闭" && state == "Disconnected"
+            if (!wantShow) {
+                try {
+                    androidx.core.app.NotificationManagerCompat.from(this)
+                        .cancel(Notifier.STATE_NOTIFICATION_ID)
+                } catch (_: Exception) {
+                }
+                Log.i(TAG, "quiet: no notification (state=$state mode=${prefs.channel})")
+                return
+            }
+            val alert = changed && ch == Notifier.CH_STATE
+            if (!changed) {
+                // 已经是「断开」且通知发过了：反复重连失败不要反复重贴通知，
+                // 否则用户手动划掉之后每次重试都会再冒出来。
+                return
+            }
+            val n = notifier.buildStateNotification(
+                state, lastDetail, Notifier.CH_STATE, alertOnlyOnce = !alert
+            )
+            Log.i(TAG, "quiet: alert notification (state=$state alert=$alert)")
+            try {
+                androidx.core.app.NotificationManagerCompat.from(this)
+                    .notify(Notifier.STATE_NOTIFICATION_ID, n)
+            } catch (_: Exception) {
+            }
+            return
+        }
+
         val alert = changed && ch == Notifier.CH_STATE
         Log.i(TAG, "post state=$state ch=$ch fg=$foreground alert=$alert")
         val n = notifier.buildStateNotification(state, lastDetail, ch, alertOnlyOnce = !alert)

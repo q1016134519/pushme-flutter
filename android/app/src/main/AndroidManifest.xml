@@ -10,6 +10,12 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!--
+      锁屏心跳靠 AlarmManager 精确闹钟把 CPU 从 suspend 里叫醒（原版同款机制）。
+      Android 13+ 起 SCHEDULE_EXACT_ALARM 要用户手动授权、Android 14 起默认不授予，
+      而 USE_EXACT_ALARM 是普通权限、装完即生效，侧载场景用它最省事。
+    -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
