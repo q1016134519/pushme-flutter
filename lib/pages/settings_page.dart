@@ -100,8 +100,8 @@ class _SettingsPageState extends State<SettingsPage> {
     };
     const warn = '「限断 / 关闭」不占用前台服务，所以通知栏能保持干净；'
         '连接靠 AlarmManager 闹钟心跳维持（和原版同一套机制），锁屏期间照常发心跳。'
-        '代价是进程保护弱一些：建议把本应用设为「不受限制」，'
-        '并在三星「电池 → 后台使用限制」里加入「从不休眠的应用」。';
+        '⚠️ 这两档必须授予「忽略电池优化」：Android 会在应用退到后台约 4 分钟后'
+        '停掉没有前台服务的后台服务。三星再加「电池 → 后台使用限制 → 从不休眠的应用」。';
     final current = _s.str('channel', '限断');
     final picked = await showModalBottomSheet<String>(
       context: context,

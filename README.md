@@ -125,8 +125,18 @@ Android 不允许降级安装。**已在用 arm64 包就不要换 universal**（
 - `AlarmManager` 用 `RTC_WAKEUP` 精确闹钟，manifest 声明 `USE_EXACT_ALARM`（普通权限、装完即生效）。
   若系统仍拒绝精确闹钟，代码会退化成 `setAndAllowWhileIdle`（Doze 下约 9 分钟一次），比「不发」好得多。
 - `START_STICKY` + `stopWithTask="false"`：划掉最近任务不清服务。
-- `BootReceiver` 开机自启。建议同时把本应用设为「不受限制」，并在 One UI 的
-  「电池 → 后台使用限制」里加入「从不休眠的应用」（Samsung 特有）。
+- `BootReceiver` 开机自启。
+
+#### 「限断 / 关闭」档必须加电池优化白名单
+
+这两个档位不用前台服务，走普通后台服务。Android 8+ 有一条**与 Doze 无关**的规则：
+app 进入后台数分钟后，系统会以 `Stopping service due to app idle` 停掉它的后台服务。
+模拟器（Android 11）实测约 **4 分钟**触发；`dumpsys deviceidle whitelist +<pkg>` 加白名单后，
+同样条件下 5 分钟以上无停止、连接保持 `ESTABLISHED`。
+
+所以这两档要长期在线，必须让用户在系统里授予「忽略电池优化」（设置页的
+「电池优化 · 待处理」就是提示），三星再加「电池 → 后台使用限制 → 从不休眠的应用」。
+前三档是前台服务，不受这条规则约束。
 
 ---
 

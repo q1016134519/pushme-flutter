@@ -299,21 +299,24 @@ class MainActivity : FlutterActivity() {
                 putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
             }
             // 直达「状态通知」那条通道的设置页。
-            // 这是唯一能把状态栏条目真正去掉的入口——而且去掉之后前台服务照旧运行，
-            // 进程保护一点不减，只是通知不再显示（见 MqttService.applyStateNotification）。
+            // 这只对前三档有意义：它们是前台服务，通知必须挂着，想隐藏只能由用户关通道。
+            // 「限断 / 关闭」根本没有状态通知，跳到某个通道页只会显示「从未使用过」，
+            // 所以直接落到应用的通知总页。
             "channel" -> {
-                val chId = when (prefs.channel) {
-                    "静音" -> Notifier.CH_STATE_LOW
-                    "限断", "仅断开时提醒", "关闭" -> Notifier.CH_STATE_QUIET
-                    else -> Notifier.CH_STATE
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (!prefs.needsForeground || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                        putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                    }
+                } else {
+                    val chId = if (prefs.channel == "静音") {
+                        Notifier.CH_STATE_LOW
+                    } else {
+                        Notifier.CH_STATE
+                    }
                     Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
                         putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
                         putExtra(Settings.EXTRA_CHANNEL_ID, chId)
                     }
-                } else {
-                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
                 }
             }
             "app" -> Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
