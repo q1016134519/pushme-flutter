@@ -480,7 +480,7 @@ class MqttService : Service(), MqttCallbackExtended {
      */
     private fun forceReconnect(reason: String) {
         MAIN.post {
-            if (!alive || stopping) return@MAIN
+            if (!alive || stopping) return@post
             Log.w(TAG, "force reconnect: $reason")
             attempt++
             connecting = false
