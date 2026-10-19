@@ -49,6 +49,18 @@ class MqttService : Service(), MqttCallbackExtended {
         /** 告诉 onCreate/onStartCommand：本次是用 startForegroundService 起的 */
         const val EXTRA_AS_FOREGROUND = "as_foreground"
 
+        /**
+         * 探活等 PUBACK 的上限。熄屏时射频从低功耗恢复要几秒，
+         * 给 12 秒能覆盖「唤醒 + 一次往返」，又不至于让状态卡太久。
+         */
+        private const val PROBE_TIMEOUT_MS = 12_000L
+
+        /**
+         * 探针多久没结论就认为「它自己被冻住了」，允许重新探。
+         * 正常一次往返只要几十毫秒，超过 90 秒必然是进程被冻过。
+         */
+        private const val PROBE_STALE_MS = 90_000L
+
         @Volatile
         var state: String = "Closed"
             private set
@@ -150,6 +162,19 @@ class MqttService : Service(), MqttCallbackExtended {
 
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var cfgReceiver: BroadcastReceiver? = null
+
+    /**
+     * 在途探活的发起时刻（墙钟）。0 = 没有在途探针。
+     *
+     * 用墙钟而不是 nanoTime：进程被冻住时 nanoTime 不走，墙钟照走 ——
+     * 这一点正是 Paho 自带 keepalive 在三星上失效的原因，见 [probe]。
+     */
+    @Volatile
+    private var probingSince = 0L
+
+    /** 最近一次拿到 broker 确认（PUBACK）的墙钟时间 */
+    @Volatile
+    private var lastAliveAt = 0L
 
     /** 亮屏 / 解锁监听：锁屏期间的兜底恢复通道 */
     private var screenReceiver: BroadcastReceiver? = null
@@ -356,19 +381,10 @@ class MqttService : Service(), MqttCallbackExtended {
         val c = client
         if (c != null && c.isConnected) {
             retry = 0
-            // 连着：让 Paho 按 keepAlive 决定这一发要不要真的发 PINGREQ。
-            // 它同时会把下一次排程时间重新写到闹钟上（见 AlarmMqttPingSender.schedule）。
-            Log.i(TAG, "tick: connected, keepalive check")
-            try {
-                PingLink.comms?.checkForActivity()
-            } catch (e: Exception) {
-                // Paho 判定 ping 超时时会在这里抛异常，并同步回调 connectionLost()，
-                // 那边已经排了重连。这里只补一次「10 秒后再来看一眼」，
-                // 避免万一没回调 connectionLost 就没人管了。
-                Log.w(TAG, "tick: ping failed (${e.javaClass.simpleName})")
-                PingLink.comms = null
-                PushAlarm.schedule(this, 10_000L)
-            }
+            // 注意：这里**不能**信 isConnected。
+            // 它只是 Paho 自己的一个布尔标志，进程被冻几分钟、broker 早已把我们踢掉，
+            // 这个标志依然是 true（socket 也还挂着 ESTABLISHED）。详见 [probe]。
+            probe(c)
             return
         }
 
@@ -388,6 +404,90 @@ class MqttService : Service(), MqttCallbackExtended {
         }
         Log.i(TAG, "tick: disconnected, reconnect now")
         connect()
+    }
+
+    /**
+     * 主动探活：往 `<topic>/hb` 发一条空的 **QoS1** 消息，等 broker 的 PUBACK。
+     *
+     * 为什么不能沿用 Paho 的 keepalive（这是真机上「看着在线、实际收不到消息」的根因）：
+     *
+     *  Paho 判断「该发 PINGREQ 了 / ping 超时了」用的是 `System.nanoTime()`，
+     *  它在 Linux 上对应 CLOCK_MONOTONIC —— **设备 suspend（熄屏、Doze）期间这个
+     *  时钟是不走的**。于是：
+     *    1. 进程被三星 Freecess 冻住几分钟、设备进了 suspend；
+     *    2. Paho 醒来后认为「才过了一瞬间」，永远不满足发 PINGREQ 的条件，一次都不发；
+     *    3. broker 按**真实时间** keepAlive×1.5 = 450 秒判定会话超时，把我们踢了；
+     *    4. 客户端毫无察觉：`isConnected` 仍是 true，socket 仍是 ESTABLISHED。
+     *  这条「僵尸连接」会一直挂着，直到用户手动重连 —— 也就是「解锁后也恢复不了」。
+     *
+     * QoS1 的 PUBACK 是协议层面**不依赖本地时钟**的往返证明：收到就是真活着，
+     * 超时就立刻推倒重连。原版 com.android.pushme 的 `[MQTTAlarmReconnect]`
+     * 闹钟做的正是这件事，这里用协议回执代替它。
+     *
+     * 顺带的好处：这条 PUBLISH 本身就是出站流量，broker 的 keepalive 计时器会被刷新，
+     * 所以 240 秒的巡检节拍同时也充当了心跳，不需要再额外发 PINGREQ。
+     */
+    private fun probe(c: MqttAsyncClient) {
+        val now = System.currentTimeMillis()
+        // 同一时刻只放一个探针。如果上一个还挂着（说明当时进程被冻住了），
+        // 超过 PROBE_STALE_MS 就认为它已经废掉，重新探。
+        if (probingSince != 0L && now - probingSince < PROBE_STALE_MS) {
+            Log.i(TAG, "probe: still waiting (${now - probingSince}ms)")
+            return
+        }
+        val topic = hbTopic()
+        if (topic == null) {
+            Log.w(TAG, "probe: no topic, skip")
+            return
+        }
+
+        val started = now
+        probingSince = started
+        val token = try {
+            c.publish(topic, ByteArray(0), 1, false)
+        } catch (e: Exception) {
+            Log.w(TAG, "probe: publish failed (${e.javaClass.simpleName})")
+            if (probingSince == started) probingSince = 0L
+            forceReconnect("probe publish failed")
+            return
+        }
+
+        Thread {
+            try {
+                token.waitForCompletion(PROBE_TIMEOUT_MS)
+                lastAliveAt = System.currentTimeMillis()
+                retry = 0
+                Log.i(TAG, "probe: alive (PUBACK)")
+            } catch (e: Exception) {
+                // 超时 / 连接已断 / broker 不回 —— 无论哪种，这条链路都不能再信了。
+                Log.w(TAG, "probe: no PUBACK (${e.javaClass.simpleName}), force reconnect")
+                forceReconnect("no PUBACK")
+            } finally {
+                if (probingSince == started) probingSince = 0L
+            }
+        }.start()
+    }
+
+    /** 探活用的私有子主题。不订阅它，所以不会变成一条用户可见的消息 */
+    private fun hbTopic(): String? =
+        target?.topic?.takeIf { it.isNotBlank() }?.let { "$it/hb" }
+
+    /**
+     * 推倒重连。
+     *
+     * 不能只调 `connect()`：僵尸客户端的 socket 还占着，Paho 里 `isConnected` 也还是 true，
+     * 直接再连会撞车。必须先 forcibly 关掉旧客户端，再建新的。
+     */
+    private fun forceReconnect(reason: String) {
+        MAIN.post {
+            if (!alive || stopping) return@MAIN
+            Log.w(TAG, "force reconnect: $reason")
+            attempt++
+            connecting = false
+            PingLink.comms = null
+            disconnectQuiet()
+            connect()
+        }
     }
 
     private fun doConnect(t: Prefs.Target, my: Int) {

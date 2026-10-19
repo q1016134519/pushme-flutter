@@ -39,10 +39,10 @@ Flutter 的 `--split-per-abi` 会给每个 ABI 加版本号偏移：
 
 | 变体 | versionCode |
 | --- | --- |
-| armeabi-v7a | 1051 |
-| arm64-v8a | 2051 |
-| x86_64 | 4051 |
-| universal | 51 |
+| armeabi-v7a | 1053 |
+| arm64-v8a | 2053 |
+| x86_64 | 4053 |
+| universal | 53 |
 
 Android 不允许降级安装。**已在用 arm64 包就不要换 universal**（会报
 `INSTALL_FAILED_VERSION_DOWNGRADE`），反过来 universal → arm64 是升级，可以直接装。
@@ -87,56 +87,141 @@ Android 不允许降级安装。**已在用 arm64 包就不要换 universal**（
 > 一旦 `stopForeground` 掉出前台，之后 `startForeground()` 会抛
 > `ForegroundServiceStartNotAllowedException`，永远回不去。所以这两档是**从一开始就不进前台**。
 
-#### 锁屏不掉线的关键：心跳用闹钟，不用定时器
+#### 锁屏不掉线的第一层：心跳用闹钟，不用定时器
 
 早期版本（以及 Paho 的默认行为）用 `TimerPingSender`，它本质上是一个 `java.util.Timer` 线程。
 **锁屏后设备进入 suspend，所有用户态线程一起停摆**，定时器自然到点不执行 —— 一个 `PINGREQ`
 都发不出去。broker（Aedes）按 `keepalive × 1.5` 判超时，到点没收到报文就 `close('keepalive timeout')`。
-表现就是「锁屏一会儿断开，解锁后重连」。
 
-现在改成 `AlarmMqttPingSender`（`android/app/src/main/kotlin/.../AlarmMqttPingSender.kt`）：
+现在心跳由 `PushAlarm` + `PingReceiver` 驱动：
 
-- `AlarmManager.setExactAndAllowWhileIdle(RTC_WAKEUP, ...)` 排下一次心跳 —— 闹钟能把 CPU 从 suspend 里叫醒；
-- 广播 `onReceive` 里短暂持有 `PARTIAL_WAKE_LOCK`（20s 上限，3s 后主动放），把发包那几百毫秒兜住；
+- `AlarmManager.setExactAndAllowWhileIdle(RTC_WAKEUP, ...)` 排下一次唤醒 —— 这是唯一能把 CPU
+  从 suspend 里精确叫醒、并且能穿透 Doze 的机制（原版 `com.android.pushme` 用的是同一套：
+  反编译可见 `AlarmPingSender` 的 type 0 + `PUSHME[AlarmPingSender]` 日志）。
+- `PingReceiver` 在 `onReceive` 里先持 `PARTIAL_WAKE_LOCK` 12 秒。**12 秒不是拍脑袋**：从 suspend
+  醒来后 WiFi 芯片要几秒才恢复到能收发，只持 3 秒会在 `PINGRESP` 回来之前就被重新挂起，
+  下一次心跳直接判定超时断开（真机上就是这么坏的，见下）。
 - `onReceive` 跑在主线程，**不能等 ping 的结果**（最长 10s 会 ANR），只调 `checkForActivity()` 就返回。
+- `MqttClient` 的构造器不接受自定义 `MqttPingSender`，所以用 `MqttAsyncClient`。
 
-这套机制和原版 `com.android.pushme` 完全同构（反编译可见它的 `AlarmPingSender` 用的就是
-`setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, ...)`（反编译里是 type 0），日志 tag 为 `PUSHME[AlarmPingSender]`）。
+#### 第二层：闹钟链必须无条件续命，且不能被 MQTT 客户端关掉
 
-`MqttClient` 的构造器不接受自定义 `MqttPingSender`，所以改用 `MqttAsyncClient`。
+这一层踩过两个坑，都是「进程活着但永远不再醒」：
 
-#### 想只在前三档隐藏状态栏图标
+1. **`pingSender.stop()` 里不能 `alarmManager.cancel()`。** Paho 在 ping 超时、broker 断开、
+   手动 disconnect 时都会调 `stop()`；旧实现顺手把闹钟取消掉，唯一的唤醒源被自己关了。
+2. **不能依赖 Paho 在失败路径上 `schedule()`。** ping 超时那一次它不会再排下一次。
 
-「限断 / 关闭」本来就没有通知，不用管。前三档是前台服务，Android 不允许它隐藏自己的通知，
-但**用户**可以关掉对应通道：设置 →「隐藏状态栏图标」→ 把该通道设为「禁止」。
-此时通知栏干净，前台服务仍在运行。
+现在闹钟归 `PushAlarm` 管，生命周期只跟「服务是否启用」绑定；`PingReceiver` 里
+**第一件事就是无条件续上下一次唤醒**，然后再去干活。
 
-> 平台规则补充：通知显示时，若来自前台服务且通道重要性 ≤ `IMPORTANCE_MIN`，
-> `NotificationManagerService.enqueueNotificationInternal()` 会把重要性抬到 `IMPORTANCE_LOW`
-> （「重要性地板」）。所以只要还在前台服务里，无论如何都留一条——这也是「限断」不走前台服务的原因之一。
+真机实测（旧版本，SM-S9310）：
+```
+20:26:08 / 20:26:59 / 20:31:59  闹钟响了 3 次
+之后 45 分钟              dumpsys alarm 里 0 次唤醒，CPU 时间几乎不增长
+```
+
+#### 第三层：三星的 Freecess 会把后台进程冻住（这是真机上最关键的一条）
+
+三星 One UI 的 `FreecessController` 会在应用退到后台后 **6~22 秒**把整个进程冻结（cgroup freezer），
+和 Doze、电池白名单都无关：
+
+```
+21:31:24  FZ  : com.daimadog.pushme reason: Bg          ← 切后台就被冻
+21:34:52  UFZ : com.daimadog.pushme reason: Alarm       ← 闹钟到点才解冻
+21:34:58  FZ  : com.daimadog.pushme reason: Bg          ← 6 秒后又冻回去
+21:34:58  disable frozen app (com.daimadog.pushme) wakelock.  ← 顺带收走唤醒锁
+```
+
+冻结期间进程一行日志都不出、Handler 不跑、socket 读线程停摆。**这不是我们代码的问题
+—— 同一台机器上的原版 `com.android.pushme` 被冻得一模一样**（`FZ : com.android.pushme reason: Bg`），
+它“看起来没掉线”是因为：
+
+- **TCP 连接在冻结期间一直保持 `ESTABLISHED`**，内核替它守着 socket，报文堆在接收缓冲区；
+- 每次闹钟解冻时把缓冲的报文读走、把 `PINGREQ` 发出去；
+- **三星在收到网络包时会主动解冻**（`UFZ ... reason: Packet`），所以只要连接还活着，消息投递是即时的。
+
+对应的实现：
+
+- `PingReceiver` **必须在 AndroidManifest 里注册**。闹钟由系统持有，进程被杀后闹钟照样会响；
+  动态注册的接收器会随进程一起消失，广播没人收，进程也就再也起不来了。清单注册之后，
+  这一次广播能把进程（连同 `MqttService`）重新拉起来。
+- 每次唤醒都走一次 `MqttService.onTick()`：**要么确认链路真的活着，要么立刻重连**，不留任何
+  「什么都不做」的分支（判活方式见第五层）。实测：检测到连接失效后 **10 秒**自动重连成功。
+- 亮屏 / 解锁（`ACTION_SCREEN_ON` / `ACTION_USER_PRESENT`）也触发一次 `onTick()`，
+  这是「解锁后不恢复」的直接对症药 —— 即使闹钟链意外断了，用户一解锁也能马上接回来。
+- 网络恢复回调（`registerDefaultNetworkCallback`）同样兜一层。
+
+#### 第四层：断线提醒要有宽限期
+
+因为上面的冻结机制，连接会周期性地「假死 → 判超时 → 重连」，一次只要几百毫秒。
+如果「限断」档一断就弹通知，用户会每隔几分钟被响一次。所以断开后 **45 秒内不提醒**，
+真正长时间连不上才弹；同一次断线只提醒一次（用户划掉后不会反复冒出来）。
+
+#### 第五层：永远不要相信 `isConnected`（僵尸连接）
+
+这一条是 5.3.0 才查出来的，也是最隐蔽的一条。
+
+`MqttAsyncClient.isConnected` 只是 Paho 自己的一个布尔标志。进程被冻结、broker 早已把会话
+踢掉之后，它**依然是 `true`**，socket 也依然挂着 `ESTABLISHED`。真机上实测到的现象是：
+
+```
+21:51:55  FZ : com.daimadog.pushme reason: LEV          ← 熄屏后被冻
+21:56:53  发布一条测试消息 →  手机无任何反应（无 UFZ reason: Packet，通知栏也没有）
+21:57:50  UFZ reason: Alarm → "tick: connected, keepalive check"   ← 仍认为连着
+21:58:24  亮屏 → "tick: connected, keepalive check"                ← 仍认为连着
+```
+
+根因是 **Paho 判断「该发 PINGREQ 了没 / ping 超时了没」用的是 `System.nanoTime()`**
+（Linux 上对应 `CLOCK_MONOTONIC`），而**设备 suspend（熄屏、Doze）期间这个时钟是不走的**：
+
+1. 进程被 Freecess 冻住、设备进 suspend，Paho 醒来后认为「才过了一瞬间」；
+2. 于是它永远不满足发 `PINGREQ` 的条件，一个心跳都不发；
+3. broker 按**真实时间** `keepAlive × 1.5 = 450 秒` 判定会话超时，把客户端踢掉；
+4. 客户端毫无察觉 —— 连接变成一条「僵尸」，收不到任何消息，也不会重连。
+
+所以判活改为**协议层面的真实往返**：每次巡检往 `<topic>/hb` 发一条空的 **QoS1** 消息，
+等 broker 回 `PUBACK`（实测 10~30 毫秒）。QoS1 的回执不依赖任何本地时钟：
+
+- 收到 `PUBACK` → 链路确实活着；
+- 12 秒内没等到 → 立刻 `disconnectForcibly()` + 重建客户端重连。
+
+这条 `PUBLISH` 本身就是出站流量，会刷新 broker 的 keepalive 计时器，所以 240 秒的巡检
+节拍同时也是心跳，不再额外发 `PINGREQ`。原版 `com.android.pushme` 的
+`[MQTTAlarmReconnect]` 闹钟做的正是「定期推倒重连」这件事，这里用协议回执代替它。
+
+顺带修掉一个副作用：`AlarmMqttPingSender.schedule()` 现在**故意什么都不做**。
+Paho 每次算「下次什么时候发 ping」都会调它，但同样因为 `nanoTime` 不走，它算出的间隔是错的
+——真机实测把稳定的 240 秒节拍打成了 `121s / 71s` 乱跳，多叫醒 CPU 却发不出真正的 ping。
+
+> 代价：连接在冻结期间死掉是必然的，消息在「死掉 → 下次巡检」这段窗口内会丢。
+> 实测这段窗口最长约等于一个巡检周期（240 秒）。在「限断」档（无前台服务）下，
+> 这是 Android + 三星冻结机制下的物理下限；要彻底不丢，需要 broker 侧持久会话
+> （`cleanSession=false` + 服务端 QoS≥1），属于服务端配置。
 
 #### 其他保活措施
 
 - 服务类型用 `specialUse`（`PROPERTY_SPECIAL_USE_FGS_SUBTYPE=persistent_mqtt_push_connection`）。
   不能用 `dataSync`：Android 15 起 `dataSync` 前台服务累计跑满 6 小时会被系统强制停止。
-- `keepAliveInterval = 300s`，由闹钟驱动。别为了「更快发现断线」把它压到 60~120s：
-  每次心跳都要把 CPU 从 suspend 里叫醒一次，一晚上几百次唤醒纯属浪费电；
-  300s 对应 broker 的超时窗口 450s，足够覆盖闹钟抖动。
+- `keepAliveInterval = 300s`，由闹钟驱动。原版实测也是 300s（`dumpsys alarm` 里两次
+  `[AlarmPingSender]` 的间隔正好 305 秒），所以这是经过验证的取值。
+  别为了「更快发现断线」压到 60~120s：每次心跳都要把 CPU 从 suspend 里叫醒一次。
+- `PushAlarm.INTERVAL_CONNECTED = 240s`：巡检间隔必须小于 keepAlive，给唤醒抖动留 60 秒余量。
 - `AlarmManager` 用 `RTC_WAKEUP` 精确闹钟，manifest 声明 `USE_EXACT_ALARM`（普通权限、装完即生效）。
   若系统仍拒绝精确闹钟，代码会退化成 `setAndAllowWhileIdle`（Doze 下约 9 分钟一次），比「不发」好得多。
+  启动日志会打印 `exactAlarm=true/false`，方便排查。
 - `START_STICKY` + `stopWithTask="false"`：划掉最近任务不清服务。
 - `BootReceiver` 开机自启。
 
-#### 「限断 / 关闭」档必须加电池优化白名单
+#### 关于电池优化白名单
 
-这两个档位不用前台服务，走普通后台服务。Android 8+ 有一条**与 Doze 无关**的规则：
-app 进入后台数分钟后，系统会以 `Stopping service due to app idle` 停掉它的后台服务。
-模拟器（Android 11）实测约 **4 分钟**触发；`dumpsys deviceidle whitelist +<pkg>` 加白名单后，
-同样条件下 5 分钟以上无停止、连接保持 `ESTABLISHED`。
+Android 8+ 有一条**与 Doze 无关**的规则：app 进入后台数分钟后，系统会以
+`Stopping service due to app idle` 停掉它的后台服务（模拟器 Android 11 实测约 4 分钟触发）。
+`dumpsys deviceidle whitelist +<pkg>` 加白名单后就不再停。
 
-所以这两档要长期在线，必须让用户在系统里授予「忽略电池优化」（设置页的
-「电池优化 · 待处理」就是提示），三星再加「电池 → 后台使用限制 → 从不休眠的应用」。
-前三档是前台服务，不受这条规则约束。
+但要注意：**白名单挡不住三星的 Freecess**。真机上两者都在白名单里（`user,com.daimadog.pushme`），
+照样被冻。所以白名单是必要条件，不是充分条件 —— 真正兜底的是上面那套闹钟自愈。
+设置页仍会提示用户授予「忽略电池优化」，三星建议把电池模式设为「不受限制」。
 
 ---
 

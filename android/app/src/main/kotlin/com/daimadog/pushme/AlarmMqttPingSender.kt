@@ -39,12 +39,18 @@ class AlarmMqttPingSender(
     }
 
     /**
-     * 压上限：Paho 有时会算出很长的间隔（例如「还有很久才到 keepAlive」），
-     * 我们不希望唤醒间隔超过 [PushAlarm.INTERVAL_CONNECTED]，否则断线恢复太慢。
+     * **故意什么都不做。**
+     *
+     * Paho 每次算「下次该什么时候发 ping」都会调这里，但它算延迟用的是
+     * `System.nanoTime()`（CLOCK_MONOTONIC）—— 设备 suspend 期间这个时钟不走，
+     * 于是它算出来的间隔是错的：真机实测把我们的 240 秒节拍打成了 121s / 71s 乱跳，
+     * 白白多叫醒几次 CPU，而且那些唤醒又不会真正发出 PINGREQ。
+     *
+     * 链路是否活着现在完全由 [MqttService.probe] 的 QoS1 PUBACK 往返来判定，
+     * 巡检节拍只由 `PushAlarm` 的 240 秒定时器驱动，所以这里保持静默。
      */
     override fun schedule(delayInMilliseconds: Long) {
-        val d = delayInMilliseconds.coerceIn(1_000L, PushAlarm.INTERVAL_CONNECTED)
-        PushAlarm.schedule(ctx, d)
+        // no-op，见上面的说明
     }
 
     override fun stop() {
@@ -61,8 +67,9 @@ class AlarmMqttPingSender(
 /**
  * 当前活着的 MQTT 客户端的内部通道。
  *
- * [PingReceiver] 在闹钟到点时需要通过它调用 `checkForActivity()` 把 PINGREQ 发出去
- * —— `ClientComms` 是 Paho 的 internal 包，只能靠 `MqttPingSender.init()` 拿到。
+ * `ClientComms` 在 Paho 的 internal 包里，只能靠 [MqttPingSender.init] 拿到。
+ * 现在链路活性由 QoS1 PUBACK 往返判定（见 `MqttService.probe`），不再需要
+ * 借它调 `checkForActivity()`；保留它只是为了在重连时能干净地断开与旧客户端的关联。
  */
 object PingLink {
     @Volatile
