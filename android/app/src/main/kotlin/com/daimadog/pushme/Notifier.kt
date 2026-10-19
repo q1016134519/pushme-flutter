@@ -52,6 +52,17 @@ class Notifier(private val ctx: Context) {
         const val CH_STATE_QUIET = "StateQuietChannel"
 
         const val STATE_NOTIFICATION_ID = 1
+
+        /**
+         * 消息通知 id 的偏移量。
+         *
+         * 消息通知原先直接用数据库自增 id（从 1 开始），第一条消息的 id 正好等于
+         * [STATE_NOTIFICATION_ID]：状态通知和消息通知会互相覆盖 ——
+         * 「限断」档在断开时重贴提醒，会顺手把用户还没看的第一条消息顶掉；
+         * 反过来消息到达又会把状态通知顶掉。加个固定偏移把两个命名空间分开。
+         */
+        private const val MESSAGE_ID_BASE = 100000
+
         const val ACTION_MARK_READ = "com.daimadog.pushme.MARK_READ"
         const val ACTION_DELETE = "com.daimadog.pushme.DELETE_MESSAGE"
         const val ACTION_REPEAT = "com.daimadog.pushme.REPEAT_MESSAGE"
@@ -173,7 +184,8 @@ class Notifier(private val ctx: Context) {
             .addAction(R.drawable.ic_stat_delete, "删除", delPi)
 
         try {
-            NotificationManagerCompat.from(ctx).notify(id.toInt(), builder.build())
+            NotificationManagerCompat.from(ctx)
+                .notify(MESSAGE_ID_BASE + id.toInt(), builder.build())
         } catch (e: SecurityException) {
             android.util.Log.w("PushMeNotifier", "notify failed: ${e.message}")
         }
@@ -181,13 +193,23 @@ class Notifier(private val ctx: Context) {
 
     fun cancelMessage(id: Long) {
         try {
-            NotificationManagerCompat.from(ctx).cancel(id.toInt())
+            NotificationManagerCompat.from(ctx).cancel(MESSAGE_ID_BASE + id.toInt())
         } catch (_: Exception) {
         }
     }
 
     fun cancelAll() {
         nm.cancelAll()
+        // cancelAll() 会把「状态通知」一起清掉。如果服务还在跑而这条通知没了，
+        // 在「通知 / 静音 / 限静」档下用户就再也看不到连接状态（只能等下次状态跃变）。
+        // 让服务按当前策略重发一次；服务没在跑就什么都不做。
+        if (!MqttService.running) return
+        try {
+            ctx.startService(
+                Intent(ctx, MqttService::class.java).setAction(MqttService.ACTION_REFRESH)
+            )
+        } catch (_: Exception) {
+        }
     }
 
     private fun broadcast(id: Long, action: String, reqCode: Int): PendingIntent {

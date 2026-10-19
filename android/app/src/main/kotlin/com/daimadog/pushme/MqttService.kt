@@ -504,8 +504,8 @@ class MqttService : Service(), MqttCallbackExtended {
      * 按当前「状态通知频道」设置，选出这条通知该走哪个 channel。
      *
      * 注意：这里只管「用哪个通道、响不响」，**不管显不显示**——
-     * 前台服务的那条通知必须一直挂着（见 [applyStateNotification] 的说明）。
-     * 想让它从通知栏消失，唯一合法的办法是用户自己在系统设置里把该通道关掉。
+     * 「通知 / 静音 / 限静」三档是前台服务，这条通知必须一直挂着；
+     * 「限断 / 关闭」走普通后台服务，显不显示由 [applyStateNotification] 的 B 分支决定。
      *
      *  - [Notifier.CH_STATE]       会响铃（断开时提醒）
      *  - [Notifier.CH_STATE_LOW]   无声、不亮屏，状态栏留图标
