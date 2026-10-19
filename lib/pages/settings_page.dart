@@ -98,49 +98,54 @@ class _SettingsPageState extends State<SettingsPage> {
       '限断': '连接正常时通知栏不显示，断开才响铃提醒',
       '关闭': '不显示任何状态通知，断开也不提醒',
     };
-    const warn = '「限断 / 关闭」不占用前台服务，所以通知栏能保持干净；'
-        '连接靠 AlarmManager 闹钟心跳维持（和原版同一套机制），锁屏期间照常发心跳。'
-        '⚠️ 这两档必须授予「忽略电池优化」：Android 会在应用退到后台约 4 分钟后'
-        '停掉没有前台服务的后台服务。三星再加「电池 → 后台使用限制 → 从不休眠的应用」。';
+    const warn = '「限断 / 关闭」不占前台服务，通知栏才干净；心跳靠闹钟，锁屏照常发。'
+        '⚠️ 必须授予「忽略电池优化」，否则退到后台约 4 分钟会被系统停掉服务'
+        '（三星再加「电池 → 后台使用限制 → 从不休眠」）。';
     final current = _s.str('channel', '限断');
     final picked = await showModalBottomSheet<String>(
       context: context,
+      // 默认弹层最高只占屏幕 9/16，底部的策略说明会被裁掉（实测 900x1600 上只剩两行）。
+      // 打开 isScrollControlled 让高度跟随内容，超出时还能滚。
+      isScrollControlled: true,
       builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 14),
-            const Text(
-              '状态通知频道',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 8),
-            for (final e in options.entries)
-              RadioListTile<String>(
-                value: e.key,
-                groupValue: current,
-                onChanged: (v) => Navigator.pop(ctx, v),
-                title: Text(
-                  e.key,
-                  style: const TextStyle(
-                    fontSize: 14.5,
-                    fontWeight: FontWeight.w600,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 14),
+              const Text(
+                '状态通知频道',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              for (final e in options.entries)
+                RadioListTile<String>(
+                  value: e.key,
+                  groupValue: current,
+                  onChanged: (v) => Navigator.pop(ctx, v),
+                  title: Text(
+                    e.key,
+                    style: const TextStyle(
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
+                  subtitle: Text(
+                    e.value,
+                    style: const TextStyle(fontSize: 11.5),
+                  ),
+                  dense: true,
                 ),
-                subtitle: Text(
-                  e.value,
-                  style: const TextStyle(fontSize: 11.5),
+              const Padding(
+                padding: EdgeInsets.fromLTRB(18, 2, 18, 10),
+                child: Text(
+                  warn,
+                  style:
+                      TextStyle(fontSize: 11, height: 1.45, color: Colors.grey),
                 ),
-                dense: true,
               ),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(18, 2, 18, 10),
-              child: Text(
-                warn,
-                style: TextStyle(fontSize: 11, height: 1.45, color: Colors.grey),
-              ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
