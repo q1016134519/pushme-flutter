@@ -156,6 +156,66 @@ class _SettingsPageState extends State<SettingsPage> {
     showToast(context, '已切换为「$picked」');
   }
 
+  Future<void> _pickNotifGroup() async {
+    const options = <String, String>{
+      '展开': '每条消息单独占一条通知，互不归档（默认）',
+      '折叠': '同一分组的消息收进一张「N 条新消息」卡片，点开才逐条显示',
+    };
+    const warn = '折叠后通知栏更清爽，代价是必须点开卡片才能逐条查看；'
+        '多应用/多渠道混在一起时尤其明显。切换立即生效，已收到的消息也会重新排布。';
+    final current = _s.str('notif_group', '展开');
+    final picked = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 14),
+              const Text(
+                '消息分组',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              for (final e in options.entries)
+                RadioListTile<String>(
+                  value: e.key,
+                  groupValue: current,
+                  onChanged: (v) => Navigator.pop(ctx, v),
+                  title: Text(
+                    e.key,
+                    style: const TextStyle(
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  subtitle: Text(
+                    e.value,
+                    style: const TextStyle(fontSize: 11.5),
+                  ),
+                  dense: true,
+                ),
+              const Padding(
+                padding: EdgeInsets.fromLTRB(18, 2, 18, 10),
+                child: Text(
+                  warn,
+                  style:
+                      TextStyle(fontSize: 11, height: 1.45, color: Colors.grey),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (picked == null) return;
+    await _s.set('notif_group', picked);
+    if (!mounted) return;
+    setState(() {});
+    showToast(context, picked == '折叠' ? '已改为折叠显示' : '已改为展开显示');
+  }
+
   Future<void> _sendTest() async {
     final titleCtrl = TextEditingController(text: '测试推送');
     final contentCtrl = TextEditingController(text: '来自 PushMe 重构版的一条测试消息 🎉');
@@ -439,6 +499,15 @@ class _SettingsPageState extends State<SettingsPage> {
                         title: '状态通知频道',
                         subtitle: _s.str('channel', '限断'),
                         onTap: _pickChannel,
+                      ),
+                      const Divider(height: 1),
+                      SettingTile(
+                        icon: Icons.unfold_more_rounded,
+                        title: '消息分组',
+                        subtitle: _s.str('notif_group', '展开') == '折叠'
+                            ? '折叠 · 同组消息收进一张卡片'
+                            : '展开 · 每条消息单独显示',
+                        onTap: _pickNotifGroup,
                       ),
                       const Divider(height: 1),
                       SettingTile(

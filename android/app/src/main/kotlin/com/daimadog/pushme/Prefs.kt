@@ -36,6 +36,9 @@ class Prefs(context: Context) {
         const val SELF_STATE = "self_state"
         const val SELF_API = "self_api"
         const val SERVICE_ENABLED = "service_enabled"
+
+        /** 通知分组方式：「展开」= 每条消息单独铺开；「折叠」= 同一分组收进一张卡片 */
+        const val NOTIF_GROUP = "notif_group"
     }
 
     private fun put(key: String, value: Any?) {
@@ -171,6 +174,19 @@ class Prefs(context: Context) {
         get() = sp.getBoolean(SERVICE_ENABLED, true)
         set(v) = put(SERVICE_ENABLED, v)
 
+    /**
+     * 分组方式，取值只有「展开」「折叠」。
+     *
+     * 默认「展开」—— 与原版 PushMe 一致：每条消息各自一条通知，互不归档。
+     */
+    var notifGroup: String
+        get() = sp.getString(NOTIF_GROUP, "展开") ?: "展开"
+        set(v) = put(NOTIF_GROUP, v)
+
+    /** 是否折叠。折叠 = 同组消息收进一张「N 条新消息」卡片，点开才看到每条 */
+    val notifGroupCollapsed: Boolean
+        get() = notifGroup == "折叠"
+
     fun selfEnabled(): Boolean = selfState == "开启" && selfHost.isNotBlank()
 
     /** 当前生效的连接参数 */
@@ -234,7 +250,8 @@ class Prefs(context: Context) {
         SELF_KEY to selfKey,
         SELF_STATE to selfState,
         SELF_API to selfApi,
-        SERVICE_ENABLED to serviceEnabled
+        SERVICE_ENABLED to serviceEnabled,
+        NOTIF_GROUP to notifGroup
     )
 
     fun set(key: String, value: Any?) = put(key, value)

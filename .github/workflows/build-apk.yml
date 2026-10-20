@@ -55,9 +55,9 @@ jobs:
       - name: Collect per-ABI APKs
         run: |
           mkdir -p dist
-          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk dist/PushMe-5.3.0-armeabi-v7a.apk
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk   dist/PushMe-5.3.0-arm64-v8a.apk
-          cp build/app/outputs/flutter-apk/app-x86_64-release.apk      dist/PushMe-5.3.0-x86_64.apk
+          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk dist/PushMe-5.4.0-armeabi-v7a.apk
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk   dist/PushMe-5.4.0-arm64-v8a.apk
+          cp build/app/outputs/flutter-apk/app-x86_64-release.apk      dist/PushMe-5.4.0-x86_64.apk
           ls -lh dist
 
       # ---- 2. 全 ABI 并存版（一个 APK 内含三种架构，体积大但通用）----
@@ -65,7 +65,7 @@ jobs:
         run: |
           flutter build apk --release --no-pub \
             --target-platform android-arm,android-arm64,android-x64
-          cp build/app/outputs/flutter-apk/app-release.apk dist/PushMe-5.3.0-universal.apk
+          cp build/app/outputs/flutter-apk/app-release.apk dist/PushMe-5.4.0-universal.apk
           ls -lh dist
 
       - name: Show final list
@@ -80,6 +80,6 @@ jobs:
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: PushMe-Flutter-5.3.0-all-abis
+          name: PushMe-Flutter-5.4.0-all-abis
           path: dist/*.apk
           if-no-files-found: error

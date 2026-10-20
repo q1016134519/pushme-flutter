@@ -63,6 +63,20 @@ class Notifier(private val ctx: Context) {
          */
         private const val MESSAGE_ID_BASE = 100000
 
+        /**
+         * 「折叠」模式下那张汇总卡片的 id。
+         *
+         * 必须落在 [MESSAGE_ID_BASE] 之下：100000 以上是消息通知的命名空间，
+         * 99999 不会和任何一条消息撞号。
+         */
+        private const val GROUP_SUMMARY_ID = 99999
+
+        /** 所有消息通知共用这一个分组键 */
+        const val GROUP_KEY = "pushme"
+
+        /** 汇总卡片里最多列几条正文（再多就只显示「共 N 条」） */
+        private const val SUMMARY_MAX_LINES = 5
+
         const val ACTION_MARK_READ = "com.daimadog.pushme.MARK_READ"
         const val ACTION_DELETE = "com.daimadog.pushme.DELETE_MESSAGE"
         const val ACTION_REPEAT = "com.daimadog.pushme.REPEAT_MESSAGE"
@@ -179,21 +193,112 @@ class Notifier(private val ctx: Context) {
             .setWhen(System.currentTimeMillis())
             .setShowWhen(true)
             .setContentIntent(openPi)
-            .setGroup("pushme")
+            .setGroup(GROUP_KEY)
             .addAction(R.drawable.ic_stat_read, "已读", readPi)
             .addAction(R.drawable.ic_stat_delete, "删除", delPi)
 
         try {
             NotificationManagerCompat.from(ctx)
                 .notify(MESSAGE_ID_BASE + id.toInt(), builder.build())
+            // 折叠模式：每来一条就刷新汇总卡片里的条数与摘要
+            if (prefs.notifGroupCollapsed) postGroupSummary()
         } catch (e: SecurityException) {
             android.util.Log.w("PushMeNotifier", "notify failed: ${e.message}")
+        }
+    }
+
+    /**
+     * 按当前设置重新应用分组方式。
+     *
+     * 设置页切换「展开 / 折叠」时调用。已有消息通知的 group 属性改不了（Notification
+     * 没有公开的 setter），但**决定是否归档的其实是这张汇总卡片**：
+     * 有它在，系统就把同组通知收进一张卡；没有它，就是一个一个平铺。
+     * 所以切换只需要贴 / 撤这张卡片，不必把已有通知全部重发一遍。
+     */
+    fun applyGroupMode(prefs: Prefs) {
+        if (prefs.notifGroupCollapsed) postGroupSummary() else nm.cancel(GROUP_SUMMARY_ID)
+    }
+
+    /**
+     * 贴出（或撤掉）分组汇总卡片。
+     *
+     * 直接读取 `activeNotifications` 而不是自己维护一份内存列表：
+     * 进程重启后内存列表就空了，而这里拿到的一定是通知栏**此刻真实存在**的消息。
+     */
+    private fun postGroupSummary() {
+        val items = try {
+            nm.activeNotifications
+                .filter { it.packageName == ctx.packageName }
+                .filter { it.id != STATE_NOTIFICATION_ID && it.id != GROUP_SUMMARY_ID }
+                .sortedBy { it.postTime }
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        if (items.isEmpty()) {
+            nm.cancel(GROUP_SUMMARY_ID)
+            return
+        }
+
+        fun textOf(n: Notification, key: String): String =
+            n.extras?.getCharSequence(key)?.toString()?.trim().orEmpty()
+
+        val style = NotificationCompat.InboxStyle()
+        items.takeLast(SUMMARY_MAX_LINES).forEach { sbn ->
+            val t = textOf(sbn.notification, Notification.EXTRA_TITLE)
+            val b = textOf(sbn.notification, Notification.EXTRA_TEXT)
+            style.addLine(when {
+                t.isBlank() -> b
+                b.isBlank() -> t
+                else -> "$t：$b"
+            })
+        }
+        if (items.size > SUMMARY_MAX_LINES) {
+            style.setSummaryText("共 ${items.size} 条消息")
+        }
+
+        val latest = items.last()
+        val latestTitle = textOf(latest.notification, Notification.EXTRA_TITLE).ifBlank { "新消息" }
+        val latestBody = textOf(latest.notification, Notification.EXTRA_TEXT)
+
+        val openIntent = Intent(ctx, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openPi = PendingIntent.getActivity(
+            ctx, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val summary = NotificationCompat.Builder(ctx, CH_MAIN)
+            .setSmallIcon(R.drawable.ic_stat_push)
+            .setContentTitle("${items.size} 条新消息")
+            .setContentText(if (latestBody.isBlank()) latestTitle else "$latestTitle：$latestBody")
+            .setStyle(style)
+            .setGroup(GROUP_KEY)
+            .setGroupSummary(true)
+            // 关键：汇总卡片自己**不要**再响一次铃，否则每来一条消息会响两遍。
+            // GROUP_ALERT_CHILDREN = 只让组内子通知提醒。
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(true)
+            .setWhen(latest.postTime)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setContentIntent(openPi)
+            .build()
+
+        try {
+            NotificationManagerCompat.from(ctx).notify(GROUP_SUMMARY_ID, summary)
+        } catch (e: SecurityException) {
+            android.util.Log.w("PushMeNotifier", "summary failed: ${e.message}")
         }
     }
 
     fun cancelMessage(id: Long) {
         try {
             NotificationManagerCompat.from(ctx).cancel(MESSAGE_ID_BASE + id.toInt())
+            // 删掉一条之后汇总卡片上的条数要跟着减
+            if (Prefs(ctx).notifGroupCollapsed) postGroupSummary()
         } catch (_: Exception) {
         }
     }
