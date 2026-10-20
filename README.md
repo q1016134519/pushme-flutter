@@ -39,10 +39,10 @@ Flutter 的 `--split-per-abi` 会给每个 ABI 加版本号偏移：
 
 | 变体 | versionCode |
 | --- | --- |
-| armeabi-v7a | 1054 |
-| arm64-v8a | 2054 |
-| x86_64 | 4054 |
-| universal | 54 |
+| armeabi-v7a | 1055 |
+| arm64-v8a | 2055 |
+| x86_64 | 4055 |
+| universal | 55 |
 
 Android 不允许降级安装。**已在用 arm64 包就不要换 universal**（会报
 `INSTALL_FAILED_VERSION_DOWNGRADE`），反过来 universal → arm64 是升级，可以直接装。
@@ -75,6 +75,20 @@ group summary 卡片**——它在就收进一张，不在就平铺。所以切�
 重发一遍，只要贴/撤这张卡片（`Notifier.applyGroupMode`）。
 
 注意：卡片本身设了 `GROUP_ALERT_CHILDREN`，**只让组内子通知响铃**，避免来一条消息响两遍。
+
+两个真机上踩到的坑，都写进代码注释了：
+
+1. **撤汇总卡会连带清空整组子通知。** 从折叠切回展开时直接 `cancel(汇总卡)`，系统会
+   以 `onNotificationRemoved ... reason : 12`（`REASON_GROUP_OPTIMIZATION`）把三条子通知
+   一起撤掉，用户看到的是「一改设置消息全没了」。所以展开要两步：先抓住在册的子通知，
+   撤完卡再用原来的 `Notification` 对象补发一遍（补发时置 `GROUP_ALERT_SUMMARY`，不重响）。
+2. **统计条数必须滤掉 `GROUP_SUMMARY`。** 系统自己会生成一张 `id=0 AUTOGROUP_SUMMARY`，
+   包名同样是 `com.daimadog.pushme`。不过滤的话它会被当成一条消息：条数虚高一条、
+   `InboxStyle` 多一行空白、`items.last()` 还选中这张空壳卡导致正文退化成「新消息」。
+   见 `Notifier.liveMessages()`。
+
+另外，系统在消息较多时仍会自动归并同应用通知（那张 `id=0` 的卡），这是 ROM 行为，
+应用侧无法关闭；「折叠」的价值在于给出**一张带条数和摘要的自定义卡片**，而不是阻止系统归并。
 
 ### 状态通知的行为
 

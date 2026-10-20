@@ -264,9 +264,21 @@ class Notifier(private val ctx: Context) {
         nm.cancel(GROUP_SUMMARY_ID)
         children.forEach { sbn ->
             val n = sbn.notification
-            // 补发只是为了「重新出现在通知栏」，不该再响一次铃
+            // 补发只是为了「重新出现在通知栏」，不该再响一次铃。
+            // GROUP_ALERT_SUMMARY = 「只有当它是汇总卡时才提醒」；补发时组里没有汇总卡，
+            // 于是这一遍是静默的。
+            //
+            // 注意：`groupAlertBehavior` 这个字段虽然有 getter，却没有 setter，
+            // Kotlin 会把它当成 val（直接赋值编译报 `'val' cannot be reassigned`），
+            // 所以这里只能走反射写字段。
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                n.groupAlertBehavior = Notification.GROUP_ALERT_SUMMARY
+                try {
+                    Notification::class.java
+                        .getField("groupAlertBehavior")
+                        .setInt(n, Notification.GROUP_ALERT_SUMMARY)
+                } catch (_: Exception) {
+                    // 反射失败也继续：最多补发时多响一声，不影响功能
+                }
             }
             n.flags = n.flags or Notification.FLAG_ONLY_ALERT_ONCE
             try {
