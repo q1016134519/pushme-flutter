@@ -156,14 +156,19 @@ class _SettingsPageState extends State<SettingsPage> {
     showToast(context, '已切换为「$picked」');
   }
 
-  Future<void> _pickNotifGroup() async {
+  /// 「消息列表」里同分组消息的显示方式。
+  ///
+  /// 注意措辞：这里只影响应用内的消息列表页，跟系统通知栏无关 ——
+  /// 通知栏始终是一条消息一张通知。
+  Future<void> _pickMsgGroup() async {
     const options = <String, String>{
-      '展开': '每条消息单独占一条通知，互不归档（默认）',
-      '折叠': '同一分组的消息收进一张「N 条新消息」卡片，点开才逐条显示',
+      '展开': '同一分组的消息也各自一行，按时间顺序铺开（默认）',
+      '折叠': '同一分组的消息收成一条，点开才看到组里逐条消息',
     };
-    const warn = '折叠后通知栏更清爽，代价是必须点开卡片才能逐条查看；'
-        '多应用/多渠道混在一起时尤其明显。切换立即生效，已收到的消息也会重新排布。';
-    final current = _s.str('notif_group', '展开');
+    const warn = '折叠只影响「消息」页的列表显示：同一天内、分组名相同的多条消息会收成一条，'
+        '标题右侧显示条数和未读数。只有一条的分组不会折叠。'
+        '通知栏不受影响，仍然是每条消息一张通知。切换立即生效。';
+    final current = _s.str('msg_group', '展开');
     final picked = await showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
@@ -210,10 +215,10 @@ class _SettingsPageState extends State<SettingsPage> {
       ),
     );
     if (picked == null) return;
-    await _s.set('notif_group', picked);
+    await _s.set('msg_group', picked);
     if (!mounted) return;
     setState(() {});
-    showToast(context, picked == '折叠' ? '已改为折叠显示' : '已改为展开显示');
+    showToast(context, picked == '折叠' ? '消息列表已改为折叠' : '消息列表已改为展开');
   }
 
   Future<void> _sendTest() async {
@@ -502,15 +507,6 @@ class _SettingsPageState extends State<SettingsPage> {
                       ),
                       const Divider(height: 1),
                       SettingTile(
-                        icon: Icons.unfold_more_rounded,
-                        title: '消息分组',
-                        subtitle: _s.str('notif_group', '展开') == '折叠'
-                            ? '折叠 · 同组消息收进一张卡片'
-                            : '展开 · 每条消息单独显示',
-                        onTap: _pickNotifGroup,
-                      ),
-                      const Divider(height: 1),
-                      SettingTile(
                         icon: Icons.visibility_off_rounded,
                         title: '隐藏状态栏图标',
                         subtitle: '仅「通知 / 静音 / 限静」三档需要；限断与关闭本身就不显示',
@@ -549,6 +545,21 @@ class _SettingsPageState extends State<SettingsPage> {
                         onTap: () => NativeApi.open('app'),
                       ),
                     ],
+                  ),
+                ),
+              ),
+              SectionHeader('消息列表'),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: SoftCard(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  child: SettingTile(
+                    icon: Icons.unfold_more_rounded,
+                    title: '消息分组',
+                    subtitle: _s.str('msg_group', '展开') == '折叠'
+                        ? '折叠 · 同组消息收成一条，点开再逐条看'
+                        : '展开 · 每条消息各占一行',
+                    onTap: _pickMsgGroup,
                   ),
                 ),
               ),

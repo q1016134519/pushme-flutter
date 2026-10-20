@@ -29,8 +29,26 @@ class _HeaderRow extends _Row {
 }
 
 class _MsgRow extends _Row {
-  const _MsgRow(this.msg);
+  const _MsgRow(this.msg, {this.indent = false});
   final MessageItem msg;
+
+  /// 是否是「组卡片展开后」的子行 —— 缩进一点，视觉上从属于上面的组
+  final bool indent;
+}
+
+/// 「折叠」模式下，同一分组（消息的 user 字段）收成的一条
+class _GroupRow extends _Row {
+  const _GroupRow({
+    required this.key,
+    required this.user,
+    required this.msgs,
+    required this.expanded,
+  });
+
+  final String key;
+  final String user;
+  final List<MessageItem> msgs;
+  final bool expanded;
 }
 
 class _MessageListPageState extends State<MessageListPage> {
@@ -57,11 +75,21 @@ class _MessageListPageState extends State<MessageListPage> {
   int _seenVersion = -1;
   int _seenSeq = 0;
 
+  /// 消息分组的显示方式：「展开」/「折叠」，见设置页
+  String _groupMode = '展开';
+
+  /// 已展开的组（key = 日期|分组名）。默认全部收起
+  final Set<String> _expandedGroups = <String>{};
+
+  /// 折叠模式：同一分组的多条消息收成一条
+  bool get _collapsed => _groupMode == '折叠';
+
   @override
   void initState() {
     super.initState();
     _seenVersion = AppState.instance.listVersion;
     _seenSeq = AppState.instance.messageSeq;
+    _groupMode = AppState.instance.str('msg_group', '展开');
     AppState.instance.addListener(_onState);
     _scroll.addListener(_onScroll);
     _load(reset: true);
@@ -80,6 +108,14 @@ class _MessageListPageState extends State<MessageListPage> {
   void _onState() {
     final state = AppState.instance;
     if (!mounted) return;
+    // 设置里切换「折叠 / 展开」后立刻重排，不用退出重进
+    final mode = state.str('msg_group', '展开');
+    if (mode != _groupMode) {
+      setState(() {
+        _groupMode = mode;
+        _rows = _buildRows(_items);
+      });
+    }
     if (state.listVersion != _seenVersion) {
       _seenVersion = state.listVersion;
       // 有新消息：静默刷新列表首屏
@@ -145,17 +181,64 @@ class _MessageListPageState extends State<MessageListPage> {
 
   List<_Row> _buildRows(List<MessageItem> items) {
     final rows = <_Row>[];
-    String? lastKey;
+
+    // 先按天切段：日期标题始终保留，分组只在同一天内部发生
+    final dayKeys = <String>[];
+    final days = <String, List<MessageItem>>{};
     for (final m in items) {
-      final key = groupKey(m.date);
-      if (key != lastKey) {
-        final sameDay = items.where((e) => groupKey(e.date) == key).length;
-        rows.add(_HeaderRow(groupLabel(m.date), sameDay));
-        lastKey = key;
+      final k = groupKey(m.date);
+      final bucket = days.putIfAbsent(k, () {
+        dayKeys.add(k);
+        return <MessageItem>[];
+      });
+      bucket.add(m);
+    }
+
+    for (final k in dayKeys) {
+      final day = days[k]!;
+      rows.add(_HeaderRow(groupLabel(day.first.date), day.length));
+
+      if (!_collapsed) {
+        rows.addAll(day.map((m) => _MsgRow(m)));
+        continue;
       }
-      rows.add(_MsgRow(m));
+
+      // 折叠：同一天内、同名分组的多条消息收成一条，位置放在该组最新一条处。
+      // 只有一条的分组不折叠 —— 收成「1 条」反而多一次点击。
+      final emitted = <String>{};
+      for (final m in day) {
+        final user = m.user.trim();
+        if (user.isEmpty) {
+          rows.add(_MsgRow(m));
+          continue;
+        }
+        if (!emitted.add(user)) continue;
+        final members = day.where((e) => e.user.trim() == user).toList();
+        if (members.length < 2) {
+          rows.add(_MsgRow(m));
+          continue;
+        }
+        final key = '$k|$user';
+        final expanded = _expandedGroups.contains(key);
+        rows.add(_GroupRow(
+          key: key,
+          user: user,
+          msgs: members,
+          expanded: expanded,
+        ));
+        if (expanded) {
+          rows.addAll(members.map((e) => _MsgRow(e, indent: true)));
+        }
+      }
     }
     return rows;
+  }
+
+  void _toggleGroup(String key) {
+    setState(() {
+      if (!_expandedGroups.remove(key)) _expandedGroups.add(key);
+      _rows = _buildRows(_items);
+    });
   }
 
   void _patch(int id, MessageItem Function(MessageItem) update) {
@@ -550,12 +633,27 @@ class _MessageListPageState extends State<MessageListPage> {
                 if (row is _HeaderRow) {
                   return _dateHeader(context, row.label, row.count);
                 }
-                final msg = (row as _MsgRow).msg;
-                return MessageTile(
+                if (row is _GroupRow) {
+                  return MessageGroupTile(
+                    user: row.user,
+                    msgs: row.msgs,
+                    expanded: row.expanded,
+                    onTap: () => _toggleGroup(row.key),
+                  );
+                }
+                final msgRow = row as _MsgRow;
+                final msg = msgRow.msg;
+                final tile = MessageTile(
                   msg: msg,
                   onTap: () => _open(msg),
                   onLongPress: () => _longPress(msg),
                   onStar: () => _toggleStar(msg),
+                );
+                if (!msgRow.indent) return tile;
+                // 组内子消息往右缩一点，视觉上挂在组卡片下面
+                return Padding(
+                  padding: const EdgeInsets.only(left: 14),
+                  child: tile,
                 );
               },
             ),

@@ -37,8 +37,14 @@ class Prefs(context: Context) {
         const val SELF_API = "self_api"
         const val SERVICE_ENABLED = "service_enabled"
 
-        /** 通知分组方式：「展开」= 每条消息单独铺开；「折叠」= 同一分组收进一张卡片 */
-        const val NOTIF_GROUP = "notif_group"
+        /**
+         * 消息列表的分组显示方式：「展开」= 每条消息单独一行；「折叠」= 同一分组
+         * （消息的 `user` 字段）收成一条，点开才逐条展开。
+         *
+         * 注意：这个设置**只影响应用内的消息列表页**，与系统通知栏无关 ——
+         * 通知栏始终是一条消息一张通知。
+         */
+        const val MSG_GROUP = "msg_group"
     }
 
     private fun put(key: String, value: Any?) {
@@ -175,17 +181,14 @@ class Prefs(context: Context) {
         set(v) = put(SERVICE_ENABLED, v)
 
     /**
-     * 分组方式，取值只有「展开」「折叠」。
+     * 消息列表的分组显示方式，取值只有「展开」「折叠」。
      *
-     * 默认「展开」—— 与原版 PushMe 一致：每条消息各自一条通知，互不归档。
+     * 默认「展开」—— 与原版 PushMe 一致：同一分组的消息也各自一行。
+     * 真正的分组渲染在 Flutter 侧（消息列表页），这里只负责存取。
      */
-    var notifGroup: String
-        get() = sp.getString(NOTIF_GROUP, "展开") ?: "展开"
-        set(v) = put(NOTIF_GROUP, v)
-
-    /** 是否折叠。折叠 = 同组消息收进一张「N 条新消息」卡片，点开才看到每条 */
-    val notifGroupCollapsed: Boolean
-        get() = notifGroup == "折叠"
+    var msgGroup: String
+        get() = sp.getString(MSG_GROUP, "展开") ?: "展开"
+        set(v) = put(MSG_GROUP, v)
 
     fun selfEnabled(): Boolean = selfState == "开启" && selfHost.isNotBlank()
 
@@ -251,7 +254,7 @@ class Prefs(context: Context) {
         SELF_STATE to selfState,
         SELF_API to selfApi,
         SERVICE_ENABLED to serviceEnabled,
-        NOTIF_GROUP to notifGroup
+        MSG_GROUP to msgGroup
     )
 
     fun set(key: String, value: Any?) = put(key, value)

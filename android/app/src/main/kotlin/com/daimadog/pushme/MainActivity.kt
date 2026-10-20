@@ -123,11 +123,9 @@ class MainActivity : FlutterActivity() {
                         Notifier(this).ensureChannels(prefs)
                         MqttService.refreshNotification(this)
                     }
-                    Prefs.NOTIF_GROUP -> {
-                        // 立刻按新方式重排：折叠就贴汇总卡片，展开就撤掉。
-                        // 不重连、不打断连接。
-                        Notifier(this).applyGroupMode(prefs)
-                    }
+                    // 注意: Prefs.MSG_GROUP（消息列表折叠 / 展开）在这里**不需要**特殊处理。
+                    // 它只是 Flutter 消息列表页的显示方式，原生侧负责存取即可，
+                    // 不碰通知栏，也不碰连接。
                 }
                 result.success(true)
             }
