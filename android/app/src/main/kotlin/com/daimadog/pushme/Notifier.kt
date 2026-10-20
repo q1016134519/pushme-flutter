@@ -9,6 +9,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.service.notification.StatusBarNotification
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 
@@ -208,32 +209,79 @@ class Notifier(private val ctx: Context) {
     }
 
     /**
+     * 当前通知栏里属于「消息」的那些通知。
+     *
+     * 直接读 `activeNotifications` 而不是自己维护一份内存列表：进程重启后内存列表就空了，
+     * 而这里拿到的一定是通知栏**此刻真实存在**的东西。
+     *
+     * 必须滤掉 GROUP_SUMMARY —— 这里有两个来源：
+     * 1. 我们自己贴的汇总卡（id=99999）；
+     * 2. **系统**在通知数变多时自动生成的 `id=0 AUTOGROUP_SUMMARY`，它的包名同样是
+     *    `com.daimadog.pushme`。不过滤的话它会被当成一条「消息」：条数虚高一条、
+     *    摘要里多一行空白、`items.last()` 还会选中这张空壳卡，导致正文退化成「新消息」。
+     */
+    private fun liveMessages(): List<StatusBarNotification> = try {
+        nm.activeNotifications
+            .filter { it.packageName == ctx.packageName }
+            .filter { it.id != STATE_NOTIFICATION_ID && it.id != GROUP_SUMMARY_ID }
+            .filter { !NotificationCompat.isGroupSummary(it.notification) }
+            .sortedBy { it.postTime }
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    /**
      * 按当前设置重新应用分组方式。
      *
      * 设置页切换「展开 / 折叠」时调用。已有消息通知的 group 属性改不了（Notification
      * 没有公开的 setter），但**决定是否归档的其实是这张汇总卡片**：
      * 有它在，系统就把同组通知收进一张卡；没有它，就是一个一个平铺。
-     * 所以切换只需要贴 / 撤这张卡片，不必把已有通知全部重发一遍。
+     *
+     * ⚠️ 坑（真机 SM-S9310 实测）：撤汇总卡**会连带撤掉整组子通知**。
+     * logcat 里是 `onNotificationRemoved ... reason : 12`
+     * （REASON_GROUP_OPTIMIZATION）—— 系统认为这组通知已经被「优化」掉了，
+     * 于是一起清空。用户看到的就是「把设置改成展开，消息全没了」。
+     *
+     * 所以展开必须两步走：先把在册的子通知抓在手里，撤完卡再原样补发一遍。
+     * 内容是复用原来的 `Notification` 对象，标题/正文/when/按钮都还在，不丢字段。
      */
     fun applyGroupMode(prefs: Prefs) {
-        if (prefs.notifGroupCollapsed) postGroupSummary() else nm.cancel(GROUP_SUMMARY_ID)
+        if (prefs.notifGroupCollapsed) {
+            postGroupSummary()
+            return
+        }
+
+        // 本来就没有汇总卡（比如反复选「展开」）就别折腾了：
+        // 重发一遍虽然不会丢东西，但会让通知栏无谓地闪一下
+        val hasSummary = try {
+            nm.activeNotifications.any { it.packageName == ctx.packageName && it.id == GROUP_SUMMARY_ID }
+        } catch (_: Exception) {
+            false
+        }
+        if (!hasSummary) return
+
+        val children = liveMessages()
+        nm.cancel(GROUP_SUMMARY_ID)
+        children.forEach { sbn ->
+            val n = sbn.notification
+            // 补发只是为了「重新出现在通知栏」，不该再响一次铃
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                n.groupAlertBehavior = Notification.GROUP_ALERT_SUMMARY
+            }
+            n.flags = n.flags or Notification.FLAG_ONLY_ALERT_ONCE
+            try {
+                nm.notify(sbn.id, n)
+            } catch (e: SecurityException) {
+                android.util.Log.w("PushMeNotifier", "repost failed: ${e.message}")
+            }
+        }
     }
 
     /**
      * 贴出（或撤掉）分组汇总卡片。
-     *
-     * 直接读取 `activeNotifications` 而不是自己维护一份内存列表：
-     * 进程重启后内存列表就空了，而这里拿到的一定是通知栏**此刻真实存在**的消息。
      */
     private fun postGroupSummary() {
-        val items = try {
-            nm.activeNotifications
-                .filter { it.packageName == ctx.packageName }
-                .filter { it.id != STATE_NOTIFICATION_ID && it.id != GROUP_SUMMARY_ID }
-                .sortedBy { it.postTime }
-        } catch (_: Exception) {
-            emptyList()
-        }
+        val items = liveMessages()
 
         if (items.isEmpty()) {
             nm.cancel(GROUP_SUMMARY_ID)
@@ -247,11 +295,13 @@ class Notifier(private val ctx: Context) {
         items.takeLast(SUMMARY_MAX_LINES).forEach { sbn ->
             val t = textOf(sbn.notification, Notification.EXTRA_TITLE)
             val b = textOf(sbn.notification, Notification.EXTRA_TEXT)
-            style.addLine(when {
+            val line = when {
                 t.isBlank() -> b
                 b.isBlank() -> t
                 else -> "$t：$b"
-            })
+            }
+            // 全空的行不要塞进去，InboxStyle 会老老实实画一条空行
+            if (line.isNotBlank()) style.addLine(line)
         }
         if (items.size > SUMMARY_MAX_LINES) {
             style.setSummaryText("共 ${items.size} 条消息")

@@ -20,8 +20,8 @@ android {
         minSdk = 24
         targetSdk = flutter.targetSdkVersion
         // 版本号与旧版 PushMe 对齐（5.1.0）
-        versionCode = 54
-        versionName = "5.4.0"
+        versionCode = 55
+        versionName = "5.4.1"
     }
 
     signingConfigs {
