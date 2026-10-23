@@ -50,10 +50,20 @@ class MqttService : Service(), MqttCallbackExtended {
         const val EXTRA_AS_FOREGROUND = "as_foreground"
 
         /**
-         * 探活等 PUBACK 的上限。熄屏时射频从低功耗恢复要几秒，
-         * 给 12 秒能覆盖「唤醒 + 一次往返」，又不至于让状态卡太久。
+         * 探活等 PUBACK 的上限。
+         *
+         * **熄屏时必须明显短于系统给的那段「解冻窗口」。** 三星 Freecess 在闹钟把进程
+         * 解冻后，大约 3~4 秒就重新冻上（真机日志：`UFZ reason: Alarm` 18:42:05.218 →
+         * `FZ reason: LEV` 18:42:08.674，只有 3.46 秒）。如果这里填 12 秒，那么
+         * 「超时 → 重连」这个决定永远落不到窗口里：线程还没等到超时就被冻住，
+         * 下一次醒来又是新一轮，锁屏期间可以无限空转、一次都连不上，只有解锁
+         * （进程长时间解冻）才恢复。
+         *
+         * 所以熄屏用 3 秒：一次往返实测只要几十毫秒，3 秒足够；真没回执也能在窗口内
+         * 做出结论并立刻发起重连。亮屏时进程不会被冻，仍用 12 秒，避免弱网误判。
          */
-        private const val PROBE_TIMEOUT_MS = 12_000L
+        private const val PROBE_TIMEOUT_SCREEN_ON = 12_000L
+        private const val PROBE_TIMEOUT_SCREEN_OFF = 3_000L
 
         /**
          * 探针多久没结论就认为「它自己被冻住了」，允许重新探。
@@ -443,6 +453,9 @@ class MqttService : Service(), MqttCallbackExtended {
 
         val started = now
         probingSince = started
+        // 熄屏时进程随时会被重新冻上，超时必须短于解冻窗口（约 3.5 秒），
+        // 否则「判定超时 → 重连」永远来不及执行。见常量注释。
+        val waitMs = if (screenOn()) PROBE_TIMEOUT_SCREEN_ON else PROBE_TIMEOUT_SCREEN_OFF
         val token = try {
             c.publish(topic, ByteArray(0), 1, false)
         } catch (e: Exception) {
@@ -454,7 +467,7 @@ class MqttService : Service(), MqttCallbackExtended {
 
         Thread {
             try {
-                token.waitForCompletion(PROBE_TIMEOUT_MS)
+                token.waitForCompletion(waitMs)
                 lastAliveAt = System.currentTimeMillis()
                 retry = 0
                 Log.i(TAG, "probe: alive (PUBACK)")
@@ -471,6 +484,16 @@ class MqttService : Service(), MqttCallbackExtended {
     /** 探活用的私有子主题。不订阅它，所以不会变成一条用户可见的消息 */
     private fun hbTopic(): String? =
         target?.topic?.takeIf { it.isNotBlank() }?.let { "$it/hb" }
+
+    /**
+     * 屏幕是否亮着。亮屏时进程不会被 Freecess 冻结，可以用宽松的探针超时；
+     * 熄屏时超时必须压到解冻窗口以内。拿不到就直接按「亮屏」处理（用宽松值更保守）。
+     */
+    private fun screenOn(): Boolean = try {
+        (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
+    } catch (_: Exception) {
+        true
+    }
 
     /**
      * 推倒重连。
@@ -508,10 +531,17 @@ class MqttService : Service(), MqttCallbackExtended {
                 isAutomaticReconnect = false
                 isCleanSession = true
                 connectionTimeout = 20
-                // 心跳 300s，由闹钟驱动。别为了「快」压到 60~120s：
-                // 每次心跳都要把 CPU 从 suspend 里叫醒一次，一晚上 700 多次唤醒纯属浪费电。
-                // 300s 下 broker 的超时窗口是 450s，足够覆盖唤醒抖动。
-                keepAliveInterval = 300
+                // keepAlive 只用来「让 broker 别踢我们」，不再承担探活职责（那由 QoS1 探针做）。
+                //
+                // 取 900s 而不是 300s：broker 的超时窗口是 keepAlive×1.5，300s 只有 450s，
+                // 而闹钟节拍是 240s —— 余量不到一拍。锁屏后 Freecess 每次只解冻约 3.5 秒，
+                // 只要有一拍没能在窗口内完成往返（WiFi 深度省电时需要几秒才能醒），
+                // 下一拍就落在 450s 之外，会话直接被踢。
+                // 900s 把窗口拉到 1350s（22.5 分钟），能容下连续好几拍失败，
+                // 避免「锁屏久了必断、解锁才恢复」。
+                // 代价只有一点：真断线时 broker 会多保留一会儿半死会话，而这条会话本来就
+                // 收不到消息，不影响任何用户可见行为。
+                keepAliveInterval = 900
                 maxInflight = 100
                 if (t.tls) {
                     val sf = buildSocketFactory(t)
